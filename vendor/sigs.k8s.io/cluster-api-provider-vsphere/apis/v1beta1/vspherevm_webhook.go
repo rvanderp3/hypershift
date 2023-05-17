@@ -35,6 +35,15 @@ func (r *VSphereVM) SetupWebhookWithManager(mgr ctrl.Manager) error {
 }
 
 // +kubebuilder:webhook:verbs=create;update,path=/validate-infrastructure-cluster-x-k8s-io-v1beta1-vspherevm,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,versions=v1beta1,name=validation.vspherevm.infrastructure.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+// +kubebuilder:webhook:verbs=create;update,path=/mutate-infrastructure-cluster-x-k8s-io-v1beta1-vspherevm,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,groups=infrastructure.cluster.x-k8s.io,resources=vspherevms,versions=v1beta1,name=default.vspherevm.infrastructure.x-k8s.io,sideEffects=None,admissionReviewVersions=v1beta1
+
+// Default implements webhook.Defaulter so a webhook will be registered for the type.
+func (r *VSphereVM) Default() {
+	// Set Linux as default OS value
+	if r.Spec.OS == "" {
+		r.Spec.OS = Linux
+	}
+}
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type.
 func (r *VSphereVM) ValidateCreate() error {
@@ -53,10 +62,14 @@ func (r *VSphereVM) ValidateCreate() error {
 		}
 	}
 
+	if r.Spec.OS == Windows && len(r.Name) > 15 {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("name"), r.Name, "name has to be less than 16 characters for Windows VM"))
+	}
 	return aggregateObjErrors(r.GroupVersionKind().GroupKind(), r.Name, allErrs)
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
+//
 //nolint:forcetypeassert
 func (r *VSphereVM) ValidateUpdate(old runtime.Object) error {
 	newVSphereVM, err := runtime.DefaultUnstructuredConverter.ToUnstructured(r)
@@ -87,6 +100,12 @@ func (r *VSphereVM) ValidateUpdate(old runtime.Object) error {
 	// allow changes to the network devices
 	delete(oldVSphereVMNetwork, "devices")
 	delete(newVSphereVMNetwork, "devices")
+
+	// allow changes to os only if the old spec has empty OS field
+	if _, ok := oldVSphereVMSpec["os"]; !ok {
+		delete(oldVSphereVMSpec, "os")
+		delete(newVSphereVMSpec, "os")
+	}
 
 	if !reflect.DeepEqual(oldVSphereVMSpec, newVSphereVMSpec) {
 		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "cannot be modified"))
