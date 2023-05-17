@@ -190,9 +190,22 @@ func (p *LocalIgnitionProvider) GetPayload(ctx context.Context, releaseImage str
 	}()
 
 	// For Azure, extract the cloud provider config file as MCO input
-	if p.CloudProvider == hyperv1.AzurePlatform {
+	switch p.CloudProvider {
+	case hyperv1.AzurePlatform:
 		cloudConfigMap := &corev1.ConfigMap{}
 		if err := p.Client.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: manifests.AzureProviderConfig("").Name}, cloudConfigMap); err != nil {
+			return nil, fmt.Errorf("failed to get cloud provider configmap: %w", err)
+		}
+		cloudConfYaml, err := yaml.Marshal(cloudConfigMap)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal cloud config: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(mcoBaseDir, "cloud.conf.configmap.yaml"), cloudConfYaml, 0644); err != nil {
+			return nil, fmt.Errorf("failed to write bootstrap kubeconfig: %w", err)
+		}
+	case hyperv1.VSpherePlatform:
+		cloudConfigMap := &corev1.ConfigMap{}
+		if err := p.Client.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: manifests.VSphereProviderConfig("").Name}, cloudConfigMap); err != nil {
 			return nil, fmt.Errorf("failed to get cloud provider configmap: %w", err)
 		}
 		cloudConfYaml, err := yaml.Marshal(cloudConfigMap)
@@ -303,7 +316,10 @@ func (p *LocalIgnitionProvider) GetPayload(ctx context.Context, releaseImage str
 		if mcsConfig.Data["user-ca-bundle-config.yaml"] != "" {
 			args = append(args, fmt.Sprintf("--additional-trust-bundle-config-file=%s/user-ca-bundle-config.yaml", configDir))
 		}
-		if p.CloudProvider == hyperv1.AzurePlatform {
+		switch p.CloudProvider {
+		case hyperv1.AzurePlatform:
+			args = append(args, fmt.Sprintf("--cloud-config-file=%s/cloud.conf.configmap.yaml", mcoBaseDir))
+		case hyperv1.VSpherePlatform:
 			args = append(args, fmt.Sprintf("--cloud-config-file=%s/cloud.conf.configmap.yaml", mcoBaseDir))
 		}
 

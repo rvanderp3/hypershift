@@ -77,6 +77,10 @@ const (
 	// a HostedControlPlane.
 	ClusterAPIPowerVSProviderImage = "hypershift.openshift.io/capi-provider-powervs-image"
 
+	// ClusterAPIVSphereProviderImage overrides the CAPI VSphere provider image to use for
+	// a HostedControlPlane.
+	ClusterAPIVSphereProviderImage = "hypershift.openshift.io/capi-provider-vsphere-image"
+
 	// AESCBCKeySecretKey defines the Kubernetes secret key name that contains the aescbc encryption key
 	// in the AESCBC secret encryption strategy
 	AESCBCKeySecretKey = "key"
@@ -607,7 +611,7 @@ const (
 
 // PlatformType is a specific supported infrastructure provider.
 //
-// +kubebuilder:validation:Enum=AWS;None;IBMCloud;Agent;KubeVirt;Azure;PowerVS
+// +kubebuilder:validation:Enum=AWS;None;IBMCloud;Agent;KubeVirt;Azure;PowerVS;VSphere
 type PlatformType string
 
 const (
@@ -631,6 +635,9 @@ const (
 
 	// PowerVSPlatform represents PowerVS infrastructure.
 	PowerVSPlatform PlatformType = "PowerVS"
+
+	// VSpherePlatform represents vSphere infrastructure.
+	VSpherePlatform PlatformType = "VSphere"
 )
 
 // PlatformSpec specifies the underlying infrastructure provider for the cluster
@@ -672,6 +679,9 @@ type PlatformSpec struct {
 	// +optional
 	// +immutable
 	Kubevirt *KubevirtPlatformSpec `json:"kubevirt,omitempty"`
+
+	// IBMCloud defines IBMCloud specific settings for components
+	VSphere *VSpherePlatformSpec `json:"vsphere,omitempty"`
 }
 
 type KubevirtPlatformCredentials struct {
@@ -737,6 +747,87 @@ type KubevirtPlatformSpec struct {
 	// the same cluster and namespace as the Hosted Control Plane.
 	// +optional
 	Credentials *KubevirtPlatformCredentials `json:"credentials,omitempty"`
+}
+
+// VSphereDiskType is a disk provisioning type for vsphere.
+// +kubebuilder:validation:Enum="";thin;thick;eagerZeroedThick
+type VSphereDiskType string
+
+const (
+	// DiskTypeThin uses Thin disk provisioning type for vsphere in the cluster.
+	DiskTypeThin VSphereDiskType = "thin"
+
+	// DiskTypeThick uses Thick disk provisioning type for vsphere in the cluster.
+	DiskTypeThick VSphereDiskType = "thick"
+
+	// DiskTypeEagerZeroedThick uses EagerZeroedThick disk provisioning type for vsphere in the cluster.
+	DiskTypeEagerZeroedThick VSphereDiskType = "eagerZeroedThick"
+)
+
+// VSpherePlatformSpec defines VSphere specific settings for components
+type VSpherePlatformSpec struct {
+	// VCenter is the domain name or IP address of the vCenter.
+	VCenter string `json:"vCenter"`
+
+	// secretName refers to name of the secret containing the username and password
+	// required to connect to the vCenter
+	SecretName string `json:"secretName"`
+
+	// Datacenter is the name of the datacenter to use in the vCenter.
+	Datacenter string `json:"datacenter"`
+
+	// DefaultDatastore is the default datastore to use for provisioning volumes.
+	DefaultDatastore string `json:"defaultDatastore"`
+
+	// Folder is the absolute path of the folder that will be used and/or created for
+	// virtual machines. The absolute path is of the form /<datacenter>/vm/<folder>/<subfolder>.
+	Folder string `json:"folder,omitempty"`
+
+	// Cluster is the name of the cluster virtual machines will be cloned into.
+	Cluster string `json:"cluster,omitempty"`
+
+	// ResourcePool is the absolute path of the resource pool where virtual machines will be
+	// created. The absolute path is of the form /<datacenter>/host/<cluster>/Resources/<resourcepool>.
+	ResourcePool string `json:"resourcePool,omitempty"`
+
+	// ClusterOSImage overrides the url provided in rhcos.json to download the RHCOS OVA
+	ClusterOSImage string `json:"clusterOSImage,omitempty"`
+
+	// APIVIP is the virtual IP address for the api endpoint
+	//
+	// +kubebuilder:validation:format=ip
+	// +optional
+	APIVIP string `json:"apiVIP,omitempty"`
+
+	// IngressVIP is the virtual IP address for ingress
+	//
+	// +kubebuilder:validation:format=ip
+	// +optional
+	IngressVIP string `json:"ingressVIP,omitempty"`
+
+	// Network specifies the name of the network to be used by the cluster.
+	Network string `json:"network,omitempty"`
+
+	// DiskType is the name of the disk provisioning type,
+	// valid values are thin, thick, and eagerZeroedThick. When not
+	// specified, it will be set according to the default storage policy
+	// of vsphere.
+	DiskType VSphereDiskType `json:"diskType,omitempty"`
+
+	// TemplateVM the name of a VM that will be cloned to create compute nodes
+	TemplateVM string `json:"templateVM"`
+
+	// NumCPUs the number of vCPUs to be assigned to a VM
+	NumCPUs int32 `json:"numCpus"`
+
+	// NumCoresPerSocket the number of CPU cores per socket
+	NumCoresPerSocket int32 `json:"numCoresPerSocket"`
+
+	// MemoryMiB the amount of memory allocated to a VM in MiB
+	MemoryMiB int64 `json:"memoryMiB"`
+
+	// DiskSizeGB the amount of storage allocated to a VM in GiB
+	DiskSizeGiB int32 `json:"diskSizeGiB"`
 }
 
 // AgentPlatformSpec specifies configuration for agent-based installations.

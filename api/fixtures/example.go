@@ -78,6 +78,7 @@ type ExampleOptions struct {
 	None                             *ExampleNoneOptions
 	Agent                            *ExampleAgentOptions
 	Kubevirt                         *ExampleKubevirtOptions
+	VSphere                          *ExampleVSphereOptions
 	Azure                            *ExampleAzureOptions
 	PowerVS                          *ExamplePowerVSOptions
 	NetworkType                      hyperv1.NetworkType
@@ -228,6 +229,10 @@ func (o ExampleOptions) Resources() *ExampleResources {
 			services = getServicePublishingStrategyMappingByAPIServerAddress(o.None.APIServerAddress, o.NetworkType)
 		} else {
 			services = getIngressServicePublishingStrategyMapping(o.NetworkType, o.ExternalDNSDomain != "")
+		}
+	case o.VSphere != nil:
+		platformSpec = hyperv1.PlatformSpec{
+			Type: hyperv1.VSpherePlatform,
 		}
 	case o.Agent != nil:
 		platformSpec = hyperv1.PlatformSpec{

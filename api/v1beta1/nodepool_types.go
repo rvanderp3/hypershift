@@ -377,6 +377,8 @@ type NodePoolPlatform struct {
 	//
 	// +optional
 	PowerVS *PowerVSNodePoolPlatform `json:"powervs,omitempty"`
+
+	VSphere *VSphereNodePoolPlatform `json:"vsphere,omitempty"`
 }
 
 // PowerVSNodePoolProcType defines processor type to be used for PowerVSNodePoolPlatform
@@ -508,6 +510,55 @@ type PowerVSNodePoolPlatform struct {
 	// +kubebuilder:validation:Enum=delete;retain
 	// +optional
 	ImageDeletePolicy PowerVSNodePoolImageDeletePolicy `json:"imageDeletePolicy,omitempty"`
+}
+
+type VSphereNodePoolPlatform struct {
+	VMSize string `json:"vmsize"`
+
+	// Template is the name of the VM or template which is cloned to create new nodes
+	Template string `json:"template"`
+	// +kubebuilder:default:=120
+	// +kubebuilder:validation:Minimum=16
+	// +optional
+	DiskSizeGB int32 `json:"diskSizeGB,omitempty"`
+
+	// Cpus is the number of vCPUs allocated to a node
+	// +kubebuilder:default:=4
+	// +kubebuilder:validation:Minimum=2
+	// +optional
+	Cpus int32 `json:"cpus,omitempty"`
+
+	// CoresPerSocket defines the topology of cores per socket to the node
+	// +kubebuilder:default:=1
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	CoresPerSocket int32 `json:"coresPerSocket,omitempty"`
+
+	// MemoryMB defines the amount of memory allocated to the node
+	// +kubebuilder:default:=16384
+	// +kubebuilder:validation:Minimum=8192
+	// +optional
+	MemoryMB int32 `json:"memoryMB,omitempty"`
+
+	// Datacenter is the name of the datacenter to use in the vCenter.
+	Datacenter string `json:"datacenter"`
+
+	// DefaultDatastore is the default datastore to use for provisioning volumes.
+	DefaultDatastore string `json:"defaultDatastore"`
+
+	// Folder is the absolute path of the folder that will be used and/or created for
+	// virtual machines. The absolute path is of the form /<datacenter>/vm/<folder>/<subfolder>.
+	Folder string `json:"folder,omitempty"`
+
+	// Cluster is the name of the cluster virtual machines will be cloned into.
+	Cluster string `json:"cluster,omitempty"`
+
+	// ResourcePool is the absolute path of the resource pool where virtual machines will be
+	// created. The absolute path is of the form /<datacenter>/host/<cluster>/Resources/<resourcepool>.
+	ResourcePool string `json:"resourcePool,omitempty"`
+
+	// Network specifies the name of the network to be used by the cluster.
+	Network string `json:"network,omitempty"`
 }
 
 // KubevirtCompute contains values associated with the virtual compute hardware requested for the VM.

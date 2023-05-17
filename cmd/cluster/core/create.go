@@ -67,6 +67,7 @@ type CreateOptions struct {
 	AWSPlatform                      AWSPlatformOptions
 	AgentPlatform                    AgentPlatformCreateOptions
 	AzurePlatform                    AzurePlatformOptions
+	VSpherePlatform                  VSpherePlatformOptions
 	PowerVSPlatform                  PowerVSPlatformOptions
 	Wait                             bool
 	Timeout                          time.Duration
@@ -121,6 +122,28 @@ type KubevirtPlatformCreateOptions struct {
 	RootVolumeAccessModes     string
 	InfraKubeConfigFile       string
 	InfraNamespace            string
+}
+
+type VSpherePlatformOptions struct {
+	VCenter           string
+	Username          string
+	Password          string
+	Datacenter        string
+	DefaultDatastore  string
+	Folder            string
+	Cluster           string
+	ResourcePool      string
+	TemplateVM        string
+	NumCPUs           int32
+	NumCoresPerSocket int32
+	MemoryMiB         int64
+	DiskSizeGB        int32
+
+	// nodepool related options
+	SysType    string
+	ProcType   hyperv1.PowerVSNodePoolProcType
+	Processors string
+	Memory     int32
 }
 
 type AWSPlatformOptions struct {

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/clusterapi/vsphere"
 	"os"
 	"strings"
 	"time"
@@ -306,7 +307,12 @@ func run(ctx context.Context, opts *StartOptions, log logr.Logger) error {
 			return err
 		}
 	}
-
+	switch hyperv1.PlatformType(opts.PrivatePlatform) {
+	case hyperv1.VSpherePlatform:
+		if err := vsphere.SetupWebhookWithManager(mgr); err != nil {
+			return fmt.Errorf("unable to create webhook: %w", err)
+		}
+	}
 	if err := (&nodepool.NodePoolReconciler{
 		Client: mgr.GetClient(),
 		ReleaseProvider: &releaseinfo.RegistryMirrorProviderDecorator{

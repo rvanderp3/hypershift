@@ -13,6 +13,7 @@ import (
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/platform/kubevirt"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/platform/none"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/platform/powervs"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/internal/platform/vsphere"
 	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/upsert"
 	imgUtil "github.com/openshift/hypershift/support/util"
@@ -31,6 +32,7 @@ var _ Platform = ibmcloud.IBMCloud{}
 var _ Platform = none.None{}
 var _ Platform = agent.Agent{}
 var _ Platform = kubevirt.Kubevirt{}
+var _ Platform = vsphere.VSphere{}
 
 type Platform interface {
 	// ReconcileCAPIInfraCR is called during HostedCluster reconciliation prior to reconciling the CAPI Cluster CR.
@@ -113,6 +115,8 @@ func GetPlatform(ctx context.Context, hcluster *hyperv1.HostedCluster, releasePr
 			}
 		}
 		platform = powervs.New(capiImageProvider)
+	case hyperv1.VSpherePlatform:
+		platform = &vsphere.VSphere{}
 	default:
 		return nil, fmt.Errorf("unsupported platform: %s", hcluster.Spec.Platform.Type)
 	}

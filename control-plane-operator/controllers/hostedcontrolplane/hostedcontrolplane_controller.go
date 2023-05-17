@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"errors"
 	"fmt"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/cloud/vsphere"
 	"math/big"
 	"net/http"
 	"os"
@@ -2053,6 +2054,13 @@ func (r *HostedControlPlaneReconciler) reconcileCloudProviderConfig(ctx context.
 			return azure.ReconcileCloudConfigWithCredentials(withSecrets, hcp, credentialsSecret)
 		}); err != nil {
 			return fmt.Errorf("failed to reconcile Azure cloud config with credentials: %w", err)
+		}
+	case hyperv1.VSpherePlatform:
+		cfg := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: hcp.Namespace, Name: "vsphere-cloud-config"}}
+		if _, err := createOrUpdate(ctx, r, cfg, func() error {
+			return vsphere.ReconcileCloudConfig(cfg, hcp)
+		}); err != nil {
+			return fmt.Errorf("failed to reconcile vsphere cloud config: %w", err)
 		}
 	}
 	return nil

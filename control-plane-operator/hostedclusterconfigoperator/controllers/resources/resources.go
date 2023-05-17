@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/cloud/vsphere"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -1278,6 +1279,56 @@ func (r *reconciler) reconcileCloudCredentialSecrets(ctx context.Context, hcp *h
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to reconcile powervs storage cloud credentials secret %w", err))
 		}
+	case hyperv1.VSpherePlatform:
+		var cloudCredentials corev1.Secret
+		err := r.cpClient.Get(ctx, client.ObjectKey{Namespace: hcp.Namespace, Name: hcp.Spec.Platform.VSphere.SecretName}, &cloudCredentials)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to reconcile vSphere cloud credentials secret %w", err))
+			return errs
+		}
+		// TO-DO: rvanderp do we need to pull in the CCO?
+		targetCloudCredentials := []corev1.Secret{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "kube-system",
+					Name:      "vsphere-creds",
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "openshift-cluster-csi-drivers",
+					Name:      "vmware-vsphere-cloud-credentials",
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "openshift-cluster-storage-operator",
+					Name:      "vsphere-cloud-credentials",
+				},
+			},
+		}
+		for _, targetCredential := range targetCloudCredentials {
+			_, err = r.CreateOrUpdate(ctx, r.client, &targetCredential, func() error {
+				usernameKey := fmt.Sprintf("%s.username", hcp.Spec.Platform.VSphere.VCenter)
+				passwordKey := fmt.Sprintf("%s.password", hcp.Spec.Platform.VSphere.VCenter)
+				username, credHasData := cloudCredentials.Data[usernameKey]
+				if !credHasData {
+					return fmt.Errorf("vsphere cloud credentials secret is missing username key %s", usernameKey)
+				}
+				password, credHasData := cloudCredentials.Data[passwordKey]
+				if !credHasData {
+					return fmt.Errorf("vsphere cloud credentials secret is missing password key %s", passwordKey)
+				}
+
+				targetCredential.Type = corev1.SecretTypeOpaque
+				if targetCredential.Data == nil {
+					targetCredential.Data = map[string][]byte{}
+				}
+				targetCredential.Data[usernameKey] = username
+				targetCredential.Data[passwordKey] = password
+				return nil
+			})
+		}
 	}
 	return errs
 }
@@ -1412,25 +1463,38 @@ func (r *reconciler) reconcileObservedConfiguration(ctx context.Context, hcp *hy
 }
 
 func (r *reconciler) reconcileCloudConfig(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
-	// This is needed for the e2e tests and only for Azure: https://github.com/openshift/origin/blob/625733dd1ce7ebf40c3dd0abd693f7bb54f2d580/test/extended/util/cluster/cluster.go#L186
-	if hcp.Spec.Platform.Type != hyperv1.AzurePlatform {
-		return nil
-	}
-
-	reference := cpomanifests.AzureProviderConfig(hcp.Namespace)
-	if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(reference), reference); err != nil {
-		return fmt.Errorf("failed to fetch %s/%s configmap from management cluster: %w", reference.Namespace, reference.Name, err)
-	}
-
-	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-config", Name: "cloud-provider-config"}}
-	if _, err := r.CreateOrUpdate(ctx, r.client, cm, func() error {
-		if cm.Data == nil {
-			cm.Data = map[string]string{}
+	switch hcp.Spec.Platform.Type {
+	case hyperv1.AzurePlatform:
+		// This is needed for the e2e tests and only for Azure: https://github.com/openshift/origin/blob/625733dd1ce7ebf40c3dd0abd693f7bb54f2d580/test/extended/util/cluster/cluster.go#L186
+		reference := cpomanifests.AzureProviderConfig(hcp.Namespace)
+		if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(reference), reference); err != nil {
+			return fmt.Errorf("failed to fetch %s/%s configmap from management cluster: %w", reference.Namespace, reference.Name, err)
 		}
-		cm.Data["config"] = reference.Data[azure.CloudConfigKey]
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to reconcile the %s/%s configmap: %w", cm.Namespace, cm.Name, err)
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-config", Name: "cloud-provider-config"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, cm, func() error {
+			if cm.Data == nil {
+				cm.Data = map[string]string{}
+			}
+			cm.Data["config"] = reference.Data[azure.CloudConfigKey]
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to reconcile the %s/%s configmap: %w", cm.Namespace, cm.Name, err)
+		}
+	case hyperv1.VSpherePlatform:
+		reference := cpomanifests.VSphereProviderConfig(hcp.Namespace)
+		if err := r.cpClient.Get(ctx, client.ObjectKeyFromObject(reference), reference); err != nil {
+			return fmt.Errorf("failed to fetch %s/%s configmap from management cluster: %w", reference.Namespace, reference.Name, err)
+		}
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-config", Name: "vsphere-cloud-config"}}
+		if _, err := r.CreateOrUpdate(ctx, r.client, cm, func() error {
+			if cm.Data == nil {
+				cm.Data = map[string]string{}
+			}
+			cm.Data[vsphere.CloudConfigKey] = reference.Data[vsphere.CloudConfigKey]
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to reconcile the %s/%s configmap: %w", cm.Namespace, cm.Name, err)
+		}
 	}
 
 	return nil

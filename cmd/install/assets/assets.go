@@ -20,6 +20,7 @@ import (
 //go:embed cluster-api-provider-kubevirt/*
 //go:embed cluster-api-provider-agent/*
 //go:embed cluster-api-provider-azure/*
+//go:embed cluster-api-provider-vsphere/*
 var crds embed.FS
 
 //go:embed recordingrules/*
@@ -49,6 +50,14 @@ var capiResources = map[string]string{
 	"cluster-api-provider-azure/infrastructure.cluster.x-k8s.io_azureclusters.yaml":                  "v1beta1",
 	"cluster-api-provider-azure/infrastructure.cluster.x-k8s.io_azuremachines.yaml":                  "v1beta1",
 	"cluster-api-provider-azure/infrastructure.cluster.x-k8s.io_azuremachinetemplates.yaml":          "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vspherecluster identities.yaml":    "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vsphereclusters.yaml":              "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vsphereclustertemplates.yaml":      "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vspherevms.yaml":                   "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vspheremachinetemplates.yaml":      "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vspheremachines.yaml":              "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vspherefailuredomains.yaml":        "v1beta1",
+	"cluster-api-provider-vsphere/infrastructure.cluster.x-k8s.io_vspheredeploymentzones.yaml":       "v1beta1",
 }
 
 func getContents(fs embed.FS, file string) []byte {
