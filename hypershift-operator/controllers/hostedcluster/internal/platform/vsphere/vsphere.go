@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"os"
 
-	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
-	"github.com/openshift/hypershift/support/images"
-	"github.com/openshift/hypershift/support/upsert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -17,9 +14,13 @@ import (
 	capivsphere "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
+	"github.com/openshift/hypershift/support/images"
+	"github.com/openshift/hypershift/support/upsert"
 )
 
-const providerImage = "gcr.io/cluster-api-provider-vsphere/release/manager:v1.3.0"
+const providerImage = "gcr.io/cluster-api-provider-vsphere/release/manager:v1.6.1"
 
 type VSphere struct{}
 
