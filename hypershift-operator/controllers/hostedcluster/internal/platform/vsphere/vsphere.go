@@ -62,7 +62,6 @@ func (v VSphere) CAPIProviderDeploymentSpec(hcluster *hyperv1.HostedCluster, hcp
 			Name:  "manager",
 			Image: image,
 			Args: []string{
-				"--enable-leader-election",
 				"--logtostderr",
 				"--v=4",
 				"--namespace=$(MY_NAMESPACE)",
