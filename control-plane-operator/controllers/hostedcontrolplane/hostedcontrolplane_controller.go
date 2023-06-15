@@ -35,6 +35,7 @@ import (
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/common"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/configoperator"
 	kubevirtcsi "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/csi/kubevirt"
+	vspherecsi "github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/csi/vsphere"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/cvo"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/dnsoperator"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/etcd"
@@ -2056,8 +2057,12 @@ func (r *HostedControlPlaneReconciler) reconcileCSIDriver(ctx context.Context, h
 		if err != nil {
 			return err
 		}
+	case hyperv1.VSpherePlatform:
+		err := vspherecsi.ReconcileInfra(r.Client, hcp, ctx, createOrUpdate, releaseImageProvider)
+		if err != nil {
+			return err
+		}
 	}
-
 	return nil
 }
 
