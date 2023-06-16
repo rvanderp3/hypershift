@@ -2408,6 +2408,11 @@ func reconcileControlPlaneOperatorRole(role *rbacv1.Role) error {
 			Verbs:     []string{"*"},
 		},
 		{
+			APIGroups: []string{"rbac.authorization.k8s.io"},
+			Resources: []string{"*"},
+			Verbs:     []string{"*"},
+		},
+		{
 			APIGroups: []string{"batch"},
 			Resources: []string{"cronjobs", "jobs"},
 			Verbs:     []string{"*"},
