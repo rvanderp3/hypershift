@@ -12,10 +12,10 @@ import (
 	"github.com/openshift/hypershift/support/config"
 	"github.com/openshift/hypershift/support/upsert"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
-	ctrl "sigs.k8s.io/controller-runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -23,21 +23,12 @@ import (
 var resources embed.FS
 
 var (
+	serviceAccount       = mustServiceAccount("03_sa.yaml")
+	role                 = mustRole("04_role.yaml")
+	roleBinding          = mustRole("05_rolebinding.yaml")
+	clusterRole          = mustClusterRole("06_clusterrole.yaml")
+	clusterRoleBinding   = mustClusterRoleBinding("07_clusterrolebinding.yaml")
 	controllerDeployment = mustDeployment("08_deployment.yaml")
-	/*infraRole                          = mustRole("infra_role.yaml")
-	infraRoleBinding                   = mustRoleBinding("infra_rolebinding.yaml")
-	tenantControllerClusterRole        = mustClusterRole("tenant_controller_clusterrole.yaml")
-	tenantControllerClusterRoleBinding = mustClusterRoleBinding("tenant_controller_clusterrolebinding.yaml")
-
-	tenantNodeClusterRole        = mustClusterRole("tenant_node_clusterrole.yaml")
-	tenantNodeClusterRoleBinding = mustClusterRoleBinding("tenant_node_clusterrolebinding.yaml")
-
-	daemonset = mustDaemonSet("daemonset.yaml")
-
-	defaultResourceRequirements = corev1.ResourceRequirements{Requests: corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse("10m"),
-		corev1.ResourceMemory: resource.MustParse("50Mi"),
-	}}*/
 )
 
 func mustDeployment(file string) *appsv1.Deployment {
@@ -54,6 +45,16 @@ func mustDeployment(file string) *appsv1.Deployment {
 func mustDaemonSet(file string) *appsv1.DaemonSet {
 	b := getContentsOrDie(file)
 	obj := &appsv1.DaemonSet{}
+	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 500).Decode(&obj); err != nil {
+		panic(err)
+	}
+
+	return obj
+}
+
+func mustServiceAccount(file string) *corev1.ServiceAccount {
+	b := getContentsOrDie(file)
+	obj := &corev1.ServiceAccount{}
 	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 500).Decode(&obj); err != nil {
 		panic(err)
 	}
@@ -120,7 +121,6 @@ func getContentsOrDie(file string) []byte {
 
 func reconcileOperatorDeployment(ctx context.Context, controller *appsv1.Deployment, hcp *hyperv1.HostedControlPlane, componentImages map[string]string) error {
 	controller.Spec = *controllerDeployment.Spec.DeepCopy()
-	log := ctrl.LoggerFrom(ctx)
 
 	imageMap := map[string]string{
 		"DRIVER_IMAGE":                "vsphere-csi-driver",
@@ -149,18 +149,21 @@ func reconcileOperatorDeployment(ctx context.Context, controller *appsv1.Deploym
 		return fmt.Errorf("no containers in template")
 	}
 
-	container := containers[0]
+	container := &containers[0]
 	for idx, envVariable := range container.Env {
 		image, exists := templateMap[envVariable.Name]
 		if !exists {
 			continue
 		}
 		container.Env[idx].Value = image
-		log.Info(fmt.Sprintf("substituting image %s with %s", &envVariable.Name, &container.Image))
 	}
 
+	container.Args = []string{
+		"start",
+		"--listen=0.0.0.0:8445",
+		"-v=4",
+	}
 	container.Image = templateMap["OPERATOR_IMAGE"]
-	log.Info(fmt.Sprintf("container image %s", &container.Image))
 	ownerRef := config.OwnerRefFrom(hcp)
 	ownerRef.ApplyTo(controller)
 
@@ -170,7 +173,6 @@ func reconcileOperatorDeployment(ctx context.Context, controller *appsv1.Deploym
 // ReconcileInfra reconciles the csi driver controller on the underlying infra/Mgmt cluster
 // that is hosting the KubeVirt VMs.
 func ReconcileInfra(client crclient.Client, hcp *hyperv1.HostedControlPlane, ctx context.Context, createOrUpdate upsert.CreateOrUpdateFN, releaseImageProvider *imageprovider.ReleaseImageProvider) error {
-
 	deployment := appsv1.Deployment{
 		ObjectMeta: v1.ObjectMeta{
 			Name:      "vsphere-csi-driver-operator",
@@ -179,11 +181,26 @@ func ReconcileInfra(client crclient.Client, hcp *hyperv1.HostedControlPlane, ctx
 	}
 
 	_, err := createOrUpdate(ctx, client, &deployment, func() error {
-		return reconcileOperatorDeployment(ctx, &deployment, releaseImageProvider.ComponentImages())
+		return reconcileOperatorDeployment(ctx, &deployment, hcp, releaseImageProvider.ComponentImages())
 	})
 	if err != nil {
 		return err
 	}
 
+	resources := []crclient.Object{
+		serviceAccount,
+		role,
+		roleBinding,
+		clusterRole,
+		clusterRoleBinding,
+	}
+	for _, resource := range resources {
+		_, err = createOrUpdate(ctx, client, resource, func() error {
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
