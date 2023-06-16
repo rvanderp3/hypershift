@@ -23,6 +23,7 @@ import (
 var resources embed.FS
 
 var (
+	configMap            = mustServiceAccount("02_configmap.yaml")
 	serviceAccount       = mustServiceAccount("03_sa.yaml")
 	role                 = mustRole("04_role.yaml")
 	roleBinding          = mustRole("05_rolebinding.yaml")
@@ -55,6 +56,16 @@ func mustDaemonSet(file string) *appsv1.DaemonSet {
 func mustServiceAccount(file string) *corev1.ServiceAccount {
 	b := getContentsOrDie(file)
 	obj := &corev1.ServiceAccount{}
+	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 500).Decode(&obj); err != nil {
+		panic(err)
+	}
+
+	return obj
+}
+
+func mustConfigMap(file string) *corev1.ConfigMap {
+	b := getContentsOrDie(file)
+	obj := &corev1.ConfigMap{}
 	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 500).Decode(&obj); err != nil {
 		panic(err)
 	}
@@ -188,6 +199,7 @@ func ReconcileInfra(client crclient.Client, hcp *hyperv1.HostedControlPlane, ctx
 	}
 
 	resources := []crclient.Object{
+		configMap,
 		serviceAccount,
 		role,
 		roleBinding,
