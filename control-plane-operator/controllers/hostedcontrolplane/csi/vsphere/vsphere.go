@@ -23,7 +23,7 @@ import (
 var resources embed.FS
 
 var (
-	configMap            = mustServiceAccount("02_configmap.yaml")
+	configMap            = mustConfigMap("02_configmap.yaml")
 	serviceAccount       = mustServiceAccount("03_sa.yaml")
 	role                 = mustRole("04_role.yaml")
 	roleBinding          = mustRole("05_rolebinding.yaml")
@@ -198,13 +198,31 @@ func ReconcileInfra(client crclient.Client, hcp *hyperv1.HostedControlPlane, ctx
 		return err
 	}
 
+	hcpConfigMap := configMap.DeepCopy()
+	hcpConfigMap.ObjectMeta.Namespace = hcp.Namespace
+
+	hcpServiceAccount := serviceAccount.DeepCopy()
+	hcpServiceAccount.ObjectMeta.Namespace = hcp.Namespace
+
+	hcpRole := role.DeepCopy()
+	hcpRole.ObjectMeta.Namespace = hcp.Namespace
+
+	hcpRoleBinding := roleBinding.DeepCopy()
+	hcpRoleBinding.ObjectMeta.Namespace = hcp.Namespace
+
+	hcpClusterRole := clusterRole.DeepCopy()
+	hcpClusterRole.ObjectMeta.Namespace = hcp.Namespace
+
+	hcpClusterRoleBinding := clusterRoleBinding.DeepCopy()
+	hcpClusterRoleBinding.ObjectMeta.Namespace = hcp.Namespace
+
 	resources := []crclient.Object{
-		configMap,
-		serviceAccount,
-		role,
-		roleBinding,
-		clusterRole,
-		clusterRoleBinding,
+		hcpConfigMap,
+		hcpServiceAccount,
+		hcpRole,
+		hcpRoleBinding,
+		hcpClusterRole,
+		hcpClusterRoleBinding,
 	}
 	for _, resource := range resources {
 		_, err = createOrUpdate(ctx, client, resource, func() error {
