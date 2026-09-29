@@ -3,15 +3,14 @@ package pki
 import (
 	"fmt"
 
-	corev1 "k8s.io/api/core/v1"
-
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/config"
 	"github.com/openshift/hypershift/support/certs"
+	"github.com/openshift/hypershift/support/config"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func ReconcileServiceAccountSigningKeySecret(secret *corev1.Secret, ownerRef config.OwnerRef) error {
-	expectedKeys := []string{ServiceSignerPrivateKey, ServiceSignerPublicKey}
-	if secret != nil && SecretUpToDate(secret, expectedKeys) {
+	if secret != nil && hasKeys(secret, ServiceSignerPrivateKey, ServiceSignerPublicKey) {
 		return nil
 	}
 	ownerRef.ApplyTo(secret)
@@ -31,4 +30,17 @@ func ReconcileServiceAccountSigningKeySecret(secret *corev1.Secret, ownerRef con
 	secret.Data[ServiceSignerPrivateKey] = keyBytes
 	secret.Data[ServiceSignerPublicKey] = publicKeyBytes
 	return nil
+}
+
+func ReconcileMetricsSAClientCertSecret(secret, ca *corev1.Secret, ownerRef config.OwnerRef) error {
+	return reconcileSignedCert(secret, ca, ownerRef, "system:serviceaccount:hypershift:prometheus", []string{"kubernetes"}, X509UsageClientAuth)
+}
+
+func hasKeys(secret *corev1.Secret, keys ...string) bool {
+	for _, key := range keys {
+		if _, hasKey := secret.Data[key]; !hasKey {
+			return false
+		}
+	}
+	return true
 }

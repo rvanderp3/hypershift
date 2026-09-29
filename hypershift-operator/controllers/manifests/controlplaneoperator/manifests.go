@@ -1,15 +1,21 @@
 package controlplaneoperator
 
 import (
-	capiibmv1 "github.com/kubernetes-sigs/cluster-api-provider-ibmcloud/api/v1alpha4"
-	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
-	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	capiawsv1 "sigs.k8s.io/cluster-api-provider-aws/api/v1alpha4"
-	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+
+	capiv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
+	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+)
+
+const (
+	ServiceSignerPrivateKey = "service-account.key"
+	ServiceSignerPublicKey  = "service-account.pub"
 )
 
 func OperatorDeployment(controlPlaneOperatorNamespace string) *appsv1.Deployment {
@@ -26,22 +32,6 @@ func OperatorServiceAccount(controlPlaneOperatorNamespace string) *corev1.Servic
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: controlPlaneOperatorNamespace,
 			Name:      "control-plane-operator",
-		},
-	}
-}
-
-func OperatorClusterRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "control-plane-operator",
-		},
-	}
-}
-
-func OperatorClusterRoleBinding(controlPlaneOperatorNamespace string) *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "control-plane-operator-" + controlPlaneOperatorNamespace,
 		},
 	}
 }
@@ -64,6 +54,42 @@ func OperatorRoleBinding(controlPlaneOperatorNamespace string) *rbacv1.RoleBindi
 	}
 }
 
+func OperatorIngressRole(ingressNamespace string, controlPlaneOperatorNamespace string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ingressNamespace,
+			Name:      "control-plane-operator-" + controlPlaneOperatorNamespace,
+		},
+	}
+}
+
+func OperatorIngressRoleBinding(ingressNamespace string, controlPlaneOperatorNamespace string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ingressNamespace,
+			Name:      "control-plane-operator-" + controlPlaneOperatorNamespace,
+		},
+	}
+}
+
+func OperatorIngressOperatorRole(ingressOperatorNamespace string, controlPlaneOperatorNamespace string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ingressOperatorNamespace,
+			Name:      "control-plane-operator-" + controlPlaneOperatorNamespace,
+		},
+	}
+}
+
+func OperatorIngressOperatorRoleBinding(ingressOperatorNamespace string, controlPlaneOperatorNamespace string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ingressOperatorNamespace,
+			Name:      "control-plane-operator-" + controlPlaneOperatorNamespace,
+		},
+	}
+}
+
 func CAPICluster(controlPlaneOperatorNamespace string, infraID string) *capiv1.Cluster {
 	return &capiv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -82,15 +108,6 @@ func HostedControlPlane(controlPlaneNamespace string, hostedClusterName string) 
 	}
 }
 
-func AWSCluster(controlPlaneNamespace string, hostedClusterName string) *capiawsv1.AWSCluster {
-	return &capiawsv1.AWSCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: controlPlaneNamespace,
-			Name:      hostedClusterName,
-		},
-	}
-}
-
 func PullSecret(controlPlaneNamespace string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -100,11 +117,11 @@ func PullSecret(controlPlaneNamespace string) *corev1.Secret {
 	}
 }
 
-func SigningKey(controlPlaneNamespace string) *corev1.Secret {
+func CombinedPullSecret(controlPlaneNamespace string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: controlPlaneNamespace,
-			Name:      "signing-key",
+			Name:      "combined-pull-secret",
 		},
 	}
 }
@@ -118,20 +135,38 @@ func SSHKey(controlPlaneNamespace string) *corev1.Secret {
 	}
 }
 
-func IBMCloudCluster(controlPlaneNamespace string, hostedClusterName string) *capiibmv1.IBMVPCCluster {
-	return &capiibmv1.IBMVPCCluster{
+func UserCABundle(controlPlaneNamespace string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
+			Name:      "user-ca-bundle",
 			Namespace: controlPlaneNamespace,
-			Name:      hostedClusterName,
 		},
 	}
 }
 
-func PodMonitor(controlPlaneNamespace string, hostedClusterName string) *prometheusoperatorv1.PodMonitor {
+func PodMonitor(controlPlaneNamespace string) *prometheusoperatorv1.PodMonitor {
 	return &prometheusoperatorv1.PodMonitor{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: controlPlaneNamespace,
-			Name:      hostedClusterName,
+			Name:      "controlplane-operator",
+		},
+	}
+}
+
+func ServiceAccountSigningKeySecret(ns string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sa-signing-key",
+			Namespace: ns,
+		},
+	}
+}
+
+func OIDCCAConfigMap(ns string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "oidc-ca",
+			Namespace: ns,
 		},
 	}
 }

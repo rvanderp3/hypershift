@@ -2,27 +2,31 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/signal"
 	"regexp"
-	"syscall"
+	"slices"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/spf13/cobra"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
+	"github.com/openshift/hypershift/cmd/log"
+	"github.com/openshift/hypershift/cmd/util"
+	supportawsutil "github.com/openshift/hypershift/support/awsutil"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 
-	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
-	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
-	"github.com/openshift/hypershift/cmd/util"
+	"github.com/go-logr/logr"
+	"github.com/spf13/cobra"
 )
 
 type CreateBastionOpts struct {
@@ -32,7 +36,10 @@ type CreateBastionOpts struct {
 	Region             string
 	SSHKeyFile         string
 	AWSCredentialsFile string
+	AWSKey             string
+	AWSSecretKey       string
 	Wait               bool
+	AdditionalTags     []string
 }
 
 func NewCreateCommand() *cobra.Command {
@@ -53,32 +60,28 @@ func NewCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.SSHKeyFile, "ssh-key-file", opts.SSHKeyFile, "File with public SSH key to use for bastion instance")
 	cmd.Flags().StringVar(&opts.AWSCredentialsFile, "aws-creds", opts.AWSCredentialsFile, "File with AWS credentials")
 	cmd.Flags().BoolVar(&opts.Wait, "wait", opts.Wait, "Wait for instance to be running")
+	cmd.Flags().StringSliceVar(&opts.AdditionalTags, "additional-tags", opts.AdditionalTags, "Additional tags to set on AWS resources (key=value)")
 
-	cmd.MarkFlagRequired("aws-creds")
+	_ = cmd.MarkFlagRequired("aws-creds")
 
-	cmd.MarkFlagFilename("ssh-key-file")
-	cmd.MarkFlagFilename("aws-creds")
+	_ = cmd.MarkFlagFilename("ssh-key-file")
+	_ = cmd.MarkFlagFilename("aws-creds")
 
-	cmd.Run = func(cmd *cobra.Command, args []string) {
+	logger := log.Log
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if err := opts.Validate(); err != nil {
-			log.Error(err, "Invalid arguments")
-			cmd.Usage()
-			return
+			logger.Error(err, "Invalid arguments")
+			_ = cmd.Usage()
+			return nil
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT)
-		go func() {
-			<-sigs
-			cancel()
-		}()
 
-		if instanceID, publicIP, err := opts.Run(ctx); err != nil {
-			log.Error(err, "Failed to create bastion")
-			os.Exit(1)
+		if instanceID, publicIP, err := opts.Run(cmd.Context(), logger); err != nil {
+			logger.Error(err, "Failed to create bastion")
+			return err
 		} else {
-			log.Info("Successfully created bastion", "id", instanceID, "publicIP", publicIP)
+			logger.Info("Successfully created bastion", "id", instanceID, "publicIP", publicIP)
 		}
+		return nil
 	}
 	return cmd
 }
@@ -102,14 +105,17 @@ func (o *CreateBastionOpts) Validate() error {
 	return nil
 }
 
-func (o *CreateBastionOpts) Run(ctx context.Context) (string, string, error) {
+func (o *CreateBastionOpts) Run(ctx context.Context, logger logr.Logger) (string, string, error) {
 
 	var infraID, region string
 	var sshPublicKey []byte
 
 	if len(o.Name) > 0 {
 		// Find HostedCluster and get AWS creds
-		c := util.GetClientOrDie()
+		c, err := util.GetClient()
+		if err != nil {
+			return "", "", err
+		}
 
 		var hostedCluster hyperv1.HostedCluster
 		if err := c.Get(ctx, types.NamespacedName{Namespace: o.Namespace, Name: o.Name}, &hostedCluster); err != nil {
@@ -121,7 +127,7 @@ func (o *CreateBastionOpts) Run(ctx context.Context) (string, string, error) {
 
 		infraID = hostedCluster.Spec.InfraID
 		region = hostedCluster.Spec.Platform.AWS.Region
-		log.Info("Found hosted cluster", "namespace", hostedCluster.Namespace, "name", hostedCluster.Name, "infraID", infraID, "region", region)
+		logger.Info("Found hosted cluster", "namespace", hostedCluster.Namespace, "name", hostedCluster.Name, "infraID", infraID, "region", region)
 
 		if len(o.SSHKeyFile) == 0 {
 			if len(hostedCluster.Spec.SSHKey.Name) == 0 {
@@ -141,29 +147,43 @@ func (o *CreateBastionOpts) Run(ctx context.Context) (string, string, error) {
 	// Read SSH public key
 	if len(o.SSHKeyFile) > 0 {
 		var err error
-		sshPublicKey, err = ioutil.ReadFile(o.SSHKeyFile)
+		sshPublicKey, err = os.ReadFile(o.SSHKeyFile)
 		if err != nil {
-			return "", "", fmt.Errorf("cannot read SSH public key from %s: %v", o.SSHKeyFile, err)
+			return "", "", fmt.Errorf("cannot read SSH public key from %s: %w", o.SSHKeyFile, err)
 		}
 	}
 
-	awsSession := awsutil.NewSession("cli-create-bastion")
-	awsConfig := awsutil.NewConfig(o.AWSCredentialsFile, region)
-	ec2Client := ec2.New(awsSession, awsConfig)
+	awsSession := awsutil.NewSession(ctx, "cli-create-bastion", o.AWSCredentialsFile, o.AWSKey, o.AWSSecretKey, region)
+	awsConfig := awsutil.NewConfig()
+	ec2Client := ec2.NewFromConfig(*awsSession, func(o *ec2.Options) {
+		o.Retryer = awsConfig()
+	})
+
+	tagMap, err := util.ParseAWSTags(o.AdditionalTags)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to parse additional tags: %w", err)
+	}
+	var additionalTags []ec2types.Tag
+	for k, v := range tagMap {
+		additionalTags = append(additionalTags, ec2types.Tag{
+			Key:   aws.String(k),
+			Value: aws.String(v),
+		})
+	}
 
 	// Ensure security group exists
-	sgID, err := ensureBastionSecurityGroup(ctx, ec2Client, infraID)
+	sgID, err := ensureBastionSecurityGroup(ctx, logger, ec2Client, infraID, o.Name, additionalTags)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to ensure security group for bastion: %w", err)
 	}
 
 	// Ensure keypair exists
-	if err := ensureBastionKeyPair(ctx, ec2Client, infraID, sshPublicKey); err != nil {
+	if err := ensureBastionKeyPair(ctx, logger, ec2Client, infraID, o.Name, sshPublicKey, additionalTags); err != nil {
 		return "", "", fmt.Errorf("failed to ensure bastion keypair: %w", err)
 	}
 
 	// Create ec2 instance
-	instanceID, err := runEC2BastionInstance(ctx, ec2Client, sgID, infraID)
+	instanceID, err := runEC2BastionInstance(ctx, logger, ec2Client, sgID, infraID, o.Name, additionalTags)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to run bastion machine instance: %w", err)
 	}
@@ -171,7 +191,7 @@ func (o *CreateBastionOpts) Run(ctx context.Context) (string, string, error) {
 	// Waiting for instance to be running
 	var publicIP string
 	if o.Wait {
-		publicIP, err = waitForInstanceRunning(ctx, ec2Client, instanceID)
+		publicIP, err = waitForInstanceRunning(ctx, logger, ec2Client, instanceID)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to wait for instance to be running: %w", err)
 		}
@@ -180,7 +200,7 @@ func (o *CreateBastionOpts) Run(ctx context.Context) (string, string, error) {
 	return instanceID, publicIP, nil
 }
 
-func ensureBastionSecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID string) (string, error) {
+func ensureBastionSecurityGroup(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, infraID, clusterName string, additionalTags []ec2types.Tag) (string, error) {
 	// find VPC
 	vpcID, err := existingVPC(ctx, ec2Client, infraID)
 	if err != nil {
@@ -197,14 +217,14 @@ func ensureBastionSecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID
 		name := securityGroupName(infraID)
 		sgCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		result, err := ec2Client.CreateSecurityGroupWithContext(sgCtx, &ec2.CreateSecurityGroupInput{
+		result, err := ec2Client.CreateSecurityGroup(sgCtx, &ec2.CreateSecurityGroupInput{
 			GroupName:   aws.String(name),
 			Description: aws.String("bastion security group"),
 			VpcId:       aws.String(vpcID),
-			TagSpecifications: []*ec2.TagSpecification{
+			TagSpecifications: []ec2types.TagSpecification{
 				{
-					ResourceType: aws.String("security-group"),
-					Tags: []*ec2.Tag{
+					ResourceType: ec2types.ResourceTypeSecurityGroup,
+					Tags: append([]ec2types.Tag{
 						{
 							Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", infraID)),
 							Value: aws.String("owned"),
@@ -213,7 +233,15 @@ func ensureBastionSecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID
 							Key:   aws.String("Name"),
 							Value: aws.String(name),
 						},
-					},
+						{
+							Key:   aws.String(supportawsutil.HypershiftInfraIDTagKey),
+							Value: aws.String(infraID),
+						},
+						{
+							Key:   aws.String(supportawsutil.HypershiftClusterNameTagKey),
+							Value: aws.String(clusterName),
+						},
+					}, additionalTags...),
 				},
 			},
 		})
@@ -231,8 +259,8 @@ func ensureBastionSecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID
 			var err error
 			describeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
-			sgResult, err = ec2Client.DescribeSecurityGroupsWithContext(describeCtx, &ec2.DescribeSecurityGroupsInput{
-				GroupIds: []*string{result.GroupId},
+			sgResult, err = ec2Client.DescribeSecurityGroups(describeCtx, &ec2.DescribeSecurityGroupsInput{
+				GroupIds: []string{aws.ToString(result.GroupId)},
 			})
 			if err != nil || len(sgResult.SecurityGroups) == 0 {
 				return fmt.Errorf("not found yet")
@@ -240,111 +268,119 @@ func ensureBastionSecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID
 			return nil
 		})
 		if err != nil {
-			return "", fmt.Errorf("cannot find security group that was just created (%s)", aws.StringValue(result.GroupId))
+			return "", fmt.Errorf("cannot find security group that was just created (%s)", aws.ToString(result.GroupId))
 		}
-		sg = sgResult.SecurityGroups[0]
-		log.Info("Created security group", "name", name, "id", aws.StringValue(sg.GroupId))
+		sg = &sgResult.SecurityGroups[0]
+		logger.Info("Created security group", "name", name, "id", aws.ToString(sg.GroupId))
 	} else {
-		log.Info("Found existing security group", "name", aws.StringValue(sg.GroupName), "id", aws.StringValue(sg.GroupId))
+		logger.Info("Found existing security group", "name", aws.ToString(sg.GroupName), "id", aws.ToString(sg.GroupId))
 	}
 
-	permission := &ec2.IpPermission{
+	permission := ec2types.IpPermission{
 		IpProtocol: aws.String("tcp"),
-		IpRanges: []*ec2.IpRange{
+		IpRanges: []ec2types.IpRange{
 			{
 				CidrIp: aws.String("0.0.0.0/0"),
 			},
 		},
-		FromPort: aws.Int64(22),
-		ToPort:   aws.Int64(22),
+		FromPort: aws.Int32(22),
+		ToPort:   aws.Int32(22),
 	}
 
 	shouldAdd := true
 	for _, p := range sg.IpPermissions {
-		if p.String() == permission.String() {
+		if aws.ToString(p.IpProtocol) != aws.ToString(permission.IpProtocol) ||
+			aws.ToInt32(p.FromPort) != aws.ToInt32(permission.FromPort) ||
+			aws.ToInt32(p.ToPort) != aws.ToInt32(permission.ToPort) {
+			continue
+		}
+		if slices.ContainsFunc(p.IpRanges, func(r ec2types.IpRange) bool {
+			return aws.ToString(r.CidrIp) == aws.ToString(permission.IpRanges[0].CidrIp)
+		}) {
 			shouldAdd = false
+			break
 		}
 	}
 	if shouldAdd {
 		authCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		_, err = ec2Client.AuthorizeSecurityGroupIngressWithContext(authCtx, &ec2.AuthorizeSecurityGroupIngressInput{
+		_, err = ec2Client.AuthorizeSecurityGroupIngress(authCtx, &ec2.AuthorizeSecurityGroupIngressInput{
 			GroupId:       sg.GroupId,
-			IpPermissions: []*ec2.IpPermission{permission},
+			IpPermissions: []ec2types.IpPermission{permission},
 		})
 		if err != nil {
 			return "", fmt.Errorf("cannot authorize ssh access on security group: %w", err)
 		}
 	}
-	return aws.StringValue(sg.GroupId), nil
+	return aws.ToString(sg.GroupId), nil
 }
 
-func existingSecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID string) (*ec2.SecurityGroup, error) {
-	filters := []*ec2.Filter{
+func existingSecurityGroup(ctx context.Context, ec2Client *ec2.Client, infraID string) (*ec2types.SecurityGroup, error) {
+	filters := []ec2types.Filter{
 		{
 			Name:   aws.String(fmt.Sprintf("tag:kubernetes.io/cluster/%s", infraID)),
-			Values: []*string{aws.String("owned")},
+			Values: []string{"owned"},
 		},
 		{
 			Name:   aws.String("tag:Name"),
-			Values: []*string{aws.String(securityGroupName(infraID))},
+			Values: []string{securityGroupName(infraID)},
 		},
 	}
 	sgCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	result, err := ec2Client.DescribeSecurityGroupsWithContext(sgCtx, &ec2.DescribeSecurityGroupsInput{Filters: filters})
+	result, err := ec2Client.DescribeSecurityGroups(sgCtx, &ec2.DescribeSecurityGroupsInput{Filters: filters})
 	if err != nil {
 		return nil, fmt.Errorf("cannot list security groups: %w", err)
 	}
-	for _, sg := range result.SecurityGroups {
-		return sg, nil
+	for i := range result.SecurityGroups {
+		return &result.SecurityGroups[i], nil
 	}
 	return nil, nil
 }
 
-func existingVPC(ctx context.Context, ec2Client *ec2.EC2, infraID string) (string, error) {
+func existingVPC(ctx context.Context, ec2Client *ec2.Client, infraID string) (string, error) {
 	var vpcID string
 	vpcCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	vpcFilter := []*ec2.Filter{
+	vpcFilter := []ec2types.Filter{
 		{
 			Name:   aws.String(fmt.Sprintf("tag:kubernetes.io/cluster/%s", infraID)),
-			Values: []*string{aws.String("owned")},
+			Values: []string{"owned"},
 		},
 		{
 			Name:   aws.String("tag:Name"),
-			Values: []*string{aws.String(vpcName(infraID))},
+			Values: []string{vpcName(infraID)},
 		},
 	}
-	result, err := ec2Client.DescribeVpcsWithContext(vpcCtx, &ec2.DescribeVpcsInput{Filters: vpcFilter})
+	result, err := ec2Client.DescribeVpcs(vpcCtx, &ec2.DescribeVpcsInput{Filters: vpcFilter})
 	if err != nil {
 		return "", fmt.Errorf("cannot list vpcs: %w", err)
 	}
 	for _, vpc := range result.Vpcs {
-		vpcID = aws.StringValue(vpc.VpcId)
+		vpcID = aws.ToString(vpc.VpcId)
 		break
 	}
 	return vpcID, nil
 }
 
-func ensureBastionKeyPair(ctx context.Context, ec2Client *ec2.EC2, infraID string, publicKey []byte) error {
+func ensureBastionKeyPair(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, infraID, clusterName string, publicKey []byte, additionalTags []ec2types.Tag) error {
 	keyPairID, err := existingKeyPair(ctx, ec2Client, infraID)
 	if err != nil {
 		return fmt.Errorf("failed to check for existing keypair: %w", err)
 	}
 	if keyPairID != "" {
-		log.Info("Found existing key pair", "id", keyPairID, "name", keyPairName(infraID))
+		logger.Info("Found existing key pair", "id", keyPairID, "name", keyPairName(infraID))
 		return nil
 	}
 	kpCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	result, err := ec2Client.ImportKeyPairWithContext(kpCtx, &ec2.ImportKeyPairInput{
+	result, err := ec2Client.ImportKeyPair(kpCtx, &ec2.ImportKeyPairInput{
 		KeyName:           aws.String(keyPairName(infraID)),
 		PublicKeyMaterial: publicKey,
-		TagSpecifications: []*ec2.TagSpecification{
+		TagSpecifications: []ec2types.TagSpecification{
 			{
-				ResourceType: aws.String("key-pair"),
-				Tags: []*ec2.Tag{
+				ResourceType: ec2types.ResourceTypeKeyPair,
+				Tags: append([]ec2types.Tag{
 					{
 						Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", infraID)),
 						Value: aws.String("owned"),
@@ -353,46 +389,93 @@ func ensureBastionKeyPair(ctx context.Context, ec2Client *ec2.EC2, infraID strin
 						Key:   aws.String("Name"),
 						Value: aws.String(keyPairName(infraID)),
 					},
-				},
+					{
+						Key:   aws.String(supportawsutil.HypershiftInfraIDTagKey),
+						Value: aws.String(infraID),
+					},
+					{
+						Key:   aws.String(supportawsutil.HypershiftClusterNameTagKey),
+						Value: aws.String(clusterName),
+					},
+				}, additionalTags...),
 			},
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to import keypair: %w", err)
 	}
-	log.Info("Created key pair", "id", aws.StringValue(result.KeyPairId), "name", aws.StringValue(result.KeyName))
+	logger.Info("Created key pair", "id", aws.ToString(result.KeyPairId), "name", aws.ToString(result.KeyName))
 	return nil
 }
 
-func existingKeyPair(ctx context.Context, ec2Client *ec2.EC2, infraID string) (string, error) {
+func existingKeyPair(ctx context.Context, ec2Client *ec2.Client, infraID string) (string, error) {
 	kpCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	result, err := ec2Client.DescribeKeyPairsWithContext(kpCtx, &ec2.DescribeKeyPairsInput{
-		KeyNames: []*string{aws.String(keyPairName(infraID))},
+	result, err := ec2Client.DescribeKeyPairs(kpCtx, &ec2.DescribeKeyPairsInput{
+		KeyNames: []string{keyPairName(infraID)},
 	})
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if awsErr.Code() == "InvalidKeyPair.NotFound" {
-				return "", nil
-			}
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidKeyPair.NotFound" {
+			return "", nil
 		}
 		return "", err
 	}
 	var keyPairID string
 	for _, kp := range result.KeyPairs {
-		keyPairID = aws.StringValue(kp.KeyPairId)
+		keyPairID = aws.ToString(kp.KeyPairId)
 	}
 	return keyPairID, nil
 }
 
-func runEC2BastionInstance(ctx context.Context, ec2Client *ec2.EC2, sgID, infraID string) (string, error) {
+func getLatestAmazonLinux2AMI(ctx context.Context, ec2Client *ec2.Client) (string, error) {
+	filters := []ec2types.Filter{
+		{
+			Name:   aws.String("name"),
+			Values: []string{"amzn2-ami-hvm-*-x86_64-gp2"},
+		},
+		{
+			Name:   aws.String("owner-alias"),
+			Values: []string{"amazon"},
+		},
+		{
+			Name:   aws.String("state"),
+			Values: []string{"available"},
+		},
+	}
+
+	amiCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	result, err := ec2Client.DescribeImages(amiCtx, &ec2.DescribeImagesInput{
+		Filters: filters,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to describe AMIs: %w", err)
+	}
+
+	if len(result.Images) == 0 {
+		return "", fmt.Errorf("no Amazon Linux 2 AMIs found")
+	}
+
+	// Find the latest AMI by creation date
+	var latestAMI ec2types.Image
+	for _, image := range result.Images {
+		if aws.ToString(image.CreationDate) > aws.ToString(latestAMI.CreationDate) {
+			latestAMI = image
+		}
+	}
+
+	return aws.ToString(latestAMI.ImageId), nil
+}
+
+func runEC2BastionInstance(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, sgID, infraID, clusterName string, additionalTags []ec2types.Tag) (string, error) {
 	// find existing instance
 	instanceID, err := existingInstance(ctx, ec2Client, infraID)
 	if err != nil {
 		return "", fmt.Errorf("cannot check for existing instances: %w", err)
 	}
 	if len(instanceID) > 0 {
-		log.Info("Found existing instance", "id", instanceID)
+		logger.Info("Found existing instance", "id", instanceID)
 		return instanceID, nil
 	}
 
@@ -405,26 +488,34 @@ func runEC2BastionInstance(ctx context.Context, ec2Client *ec2.EC2, sgID, infraI
 		return "", fmt.Errorf("no public subnet was found")
 	}
 
+	// get latest Amazon Linux 2 AMI
+	amiID, err := getLatestAmazonLinux2AMI(ctx, ec2Client)
+	if err != nil {
+		logger.Info("Failed to get latest AMI via API, falling back to SSM parameter", "error", err)
+		amiID = "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+	}
+	logger.Info("Using AMI", "id", amiID)
+
 	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	result, err := ec2Client.RunInstancesWithContext(runCtx, &ec2.RunInstancesInput{
-		ImageId:      aws.String("resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"),
-		MaxCount:     aws.Int64(1),
-		MinCount:     aws.Int64(1),
-		InstanceType: aws.String("t2.micro"),
+	result, err := ec2Client.RunInstances(runCtx, &ec2.RunInstancesInput{
+		ImageId:      aws.String(amiID),
+		MaxCount:     aws.Int32(1),
+		MinCount:     aws.Int32(1),
+		InstanceType: ec2types.InstanceTypeT2Micro,
 		KeyName:      aws.String(keyPairName(infraID)),
-		NetworkInterfaces: []*ec2.InstanceNetworkInterfaceSpecification{
+		NetworkInterfaces: []ec2types.InstanceNetworkInterfaceSpecification{
 			{
-				DeviceIndex:              aws.Int64(0),
+				DeviceIndex:              aws.Int32(0),
 				AssociatePublicIpAddress: aws.Bool(true),
 				SubnetId:                 aws.String(subnetID),
-				Groups:                   []*string{aws.String(sgID)},
+				Groups:                   []string{sgID},
 			},
 		},
-		TagSpecifications: []*ec2.TagSpecification{
+		TagSpecifications: []ec2types.TagSpecification{
 			{
-				ResourceType: aws.String("instance"),
-				Tags: []*ec2.Tag{
+				ResourceType: ec2types.ResourceTypeInstance,
+				Tags: append([]ec2types.Tag{
 					{
 						Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", infraID)),
 						Value: aws.String("owned"),
@@ -433,7 +524,15 @@ func runEC2BastionInstance(ctx context.Context, ec2Client *ec2.EC2, sgID, infraI
 						Key:   aws.String("Name"),
 						Value: aws.String(instanceName(infraID)),
 					},
-				},
+					{
+						Key:   aws.String(supportawsutil.HypershiftInfraIDTagKey),
+						Value: aws.String(infraID),
+					},
+					{
+						Key:   aws.String(supportawsutil.HypershiftClusterNameTagKey),
+						Value: aws.String(clusterName),
+					},
+				}, additionalTags...),
 			},
 		},
 	})
@@ -441,24 +540,24 @@ func runEC2BastionInstance(ctx context.Context, ec2Client *ec2.EC2, sgID, infraI
 		return "", fmt.Errorf("failed to launch bastion instance: %w", err)
 	}
 	for _, instance := range result.Instances {
-		instanceID := aws.StringValue(instance.InstanceId)
-		log.Info("Created ec2 instance", "id", instanceID, "name", instanceName(infraID))
+		instanceID := aws.ToString(instance.InstanceId)
+		logger.Info("Created ec2 instance", "id", instanceID, "name", instanceName(infraID))
 		return instanceID, nil
 	}
 	return "", fmt.Errorf("no instances were created")
 }
 
-func existingSubnet(ctx context.Context, ec2Client *ec2.EC2, infraID string) (string, error) {
+func existingSubnet(ctx context.Context, ec2Client *ec2.Client, infraID string) (string, error) {
 	var subnetID string
 	subCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	subnetFilter := []*ec2.Filter{
+	subnetFilter := []ec2types.Filter{
 		{
 			Name:   aws.String(fmt.Sprintf("tag:kubernetes.io/cluster/%s", infraID)),
-			Values: []*string{aws.String("owned")},
+			Values: []string{"owned"},
 		},
 	}
-	result, err := ec2Client.DescribeSubnetsWithContext(subCtx, &ec2.DescribeSubnetsInput{
+	result, err := ec2Client.DescribeSubnets(subCtx, &ec2.DescribeSubnetsInput{
 		Filters: subnetFilter,
 	})
 	if err != nil {
@@ -468,8 +567,8 @@ func existingSubnet(ctx context.Context, ec2Client *ec2.EC2, infraID string) (st
 	for _, subnet := range result.Subnets {
 		var name string
 		for _, tag := range subnet.Tags {
-			if aws.StringValue(tag.Key) == "Name" {
-				name = aws.StringValue(tag.Value)
+			if aws.ToString(tag.Key) == "Name" {
+				name = aws.ToString(tag.Value)
 				break
 			}
 		}
@@ -477,27 +576,27 @@ func existingSubnet(ctx context.Context, ec2Client *ec2.EC2, infraID string) (st
 			continue
 		}
 		if nameRe.MatchString(name) {
-			subnetID = aws.StringValue(subnet.SubnetId)
+			subnetID = aws.ToString(subnet.SubnetId)
 			break
 		}
 	}
 	return subnetID, nil
 }
 
-func existingInstance(ctx context.Context, ec2Client *ec2.EC2, infraID string) (string, error) {
+func existingInstance(ctx context.Context, ec2Client *ec2.Client, infraID string) (string, error) {
 	instanceCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	instanceFilter := []*ec2.Filter{
+	instanceFilter := []ec2types.Filter{
 		{
 			Name:   aws.String(fmt.Sprintf("tag:kubernetes.io/cluster/%s", infraID)),
-			Values: []*string{aws.String("owned")},
+			Values: []string{"owned"},
 		},
 		{
 			Name:   aws.String("tag:Name"),
-			Values: []*string{aws.String(instanceName(infraID))},
+			Values: []string{instanceName(infraID)},
 		},
 	}
-	result, err := ec2Client.DescribeInstancesWithContext(instanceCtx, &ec2.DescribeInstancesInput{
+	result, err := ec2Client.DescribeInstances(instanceCtx, &ec2.DescribeInstancesInput{
 		Filters: instanceFilter,
 	})
 	if err != nil {
@@ -505,47 +604,36 @@ func existingInstance(ctx context.Context, ec2Client *ec2.EC2, infraID string) (
 	}
 	for _, reservation := range result.Reservations {
 		for _, instance := range reservation.Instances {
-			if aws.StringValue(instance.State.Name) == "terminated" {
+			if instance.State.Name == ec2types.InstanceStateNameTerminated {
 				continue
 			}
-			return aws.StringValue(instance.InstanceId), nil
+			return aws.ToString(instance.InstanceId), nil
 		}
 	}
 	return "", nil
 }
 
-func waitForInstanceRunning(ctx context.Context, ec2Client *ec2.EC2, instanceID string) (string, error) {
+func waitForInstanceRunning(ctx context.Context, _ logr.Logger, ec2Client *ec2.Client, instanceID string) (string, error) {
 
 	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	err := wait.PollImmediateUntil(5*time.Second, func() (bool, error) {
-		err := ec2Client.WaitUntilInstanceRunningWithContext(ctx, &ec2.DescribeInstancesInput{
-			InstanceIds: []*string{aws.String(instanceID)},
-		})
-		if err != nil {
-			if awsErr, ok := err.(awserr.Error); ok {
-				if awsErr.Code() == "ResourceNotReady" {
-					return false, nil
-				}
-			}
-			return false, fmt.Errorf("error waiting for intance running: %w", err)
-		}
-		return true, nil
-	}, waitCtx.Done())
-	if err != nil {
-		return "", err
+	waiter := ec2.NewInstanceRunningWaiter(ec2Client)
+	if err := waiter.Wait(waitCtx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 2*time.Minute); err != nil {
+		return "", fmt.Errorf("error waiting for instance running: %w", err)
 	}
 	describeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	result, err := ec2Client.DescribeInstancesWithContext(describeCtx, &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{aws.String(instanceID)},
+	result, err := ec2Client.DescribeInstances(describeCtx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
 	})
 	if err != nil {
 		return "", err
 	}
 	for _, res := range result.Reservations {
 		for _, instance := range res.Instances {
-			return aws.StringValue(instance.PublicIpAddress), nil
+			return aws.ToString(instance.PublicIpAddress), nil
 		}
 	}
 	return "", nil

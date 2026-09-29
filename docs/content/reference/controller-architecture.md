@@ -1,28 +1,18 @@
-# Controller Architecture
-
-## Glossary
-
-**Management Cluster**. An OpenShift cluster which hosts HyperShift and zero to many Hosted Clusters.
-
-**Hosted Cluster**. An OpenShift API endpoint managed by HyperShift.
-
-**Hosted Control Plane**. An OpenShift control plane running on the Management Cluster which is exposed by a Hosted Cluster's API endpoint. The component parts of a control plane include etcd, apiserver, kube-controller-manager, vpn, etc.
-
-**Hosted Control Plane Infrastructure**. Resources on the Management Cluster or external cloud provider which are prerequisites to running Hosted Control Plane processes.
-
-**Management Cluster Infrastructure**: network, compute, storage, etc. of the Management Cluster.
-
-**Hosted Cluster Infrastructure**: network, compute, storage, etc. that exist in customer cloud account.
+# Controller architecture
 
 ## High Level Overview
-
 
 ### Physical layout and operating model
 
 Legend:
+
 - Yellow box: namespace
 - Rounded box: processes
 - Rectangle: CR instances
+- Solid arrow (`-->`) with **reconciles**: a controller watches the resource and actively reconciles it
+- Solid arrow (`-->`) with **creates**: a controller creates the resource
+- Solid arrow (`-->`) with **operates**: a controller manages/deploys another process
+- Dotted arrow (`-.->`) with **consumes**: a process reads or references the resource as input without actively watching or reconciling it (i.e. the resource is treated as an input/lookup, not as a trigger for a reconcile loop)
 
 ```mermaid
 flowchart LR
@@ -75,12 +65,8 @@ flowchart LR
 
   capi-provider-->|reconciles|capi-machine
   capi-provider-->|creates|capi-provider-machine
+  capi-provider-.->|consumes|capi-machine-template
 ```
-
-TODO:
-1. How do we (or should we) represent an input/output or "consumes" relationship (e.g. the hypershift operator creates and syncs machine templates, and the CAPI provider _reads_ the template, but nothing actively watches templates and does work in reaction to them directly)
-
-
 
 ## Major Components
 
@@ -92,7 +78,7 @@ A single version of the the HyperShift Operator knows how to manage multiple hos
 
 The HyperShift Operator is responsible for:
 
-- Processing `HostedCluster` and `NodePool` resources and managing Control Plane Operator and CAPI deployments which do the actual work of installing a control plane.
+- Processing `HostedCluster` and `NodePool` resources and managing Control Plane Operator and [Cluster API (CAPI)](https://github.com/kubernetes-sigs/cluster-api) deployments which do the actual work of installing a control plane.
 - Managing the lifecycle of the hosted cluster by handling rollouts of new Control Plane Operator and CAPI deployments based on version changes to `HostedCluster` and `NodePool` resources.
 - Aggregating and surfacing information about clusters.
 
@@ -174,7 +160,7 @@ graph TD
 
 ### Control Plane Operator
 
-The **Control Plane Operator** is a deployed by the HyperShift Operator into a hosted control plane namespace and manages the rollout of a single version of the the hosted cluster's control plane.
+The **Control Plane Operator** is deployed by the HyperShift Operator into a hosted control plane namespace and manages the rollout of a single version of the the hosted cluster's control plane.
 
 The Control Plane Operator is versioned in lockstep with a specific OCP version and is decoupled from the management cluster's version.
 
@@ -218,9 +204,27 @@ The Hosted Cluster Config Operator is versioned in lockstep with a specific OCP 
 
 The Hosted Cluster Config Operator is responsible for:
 
-- Approving CSRs?
 - Reading CAs from the hosted cluster to configure the kube controller manager CA bundle running in the hosted control plane
-- TODO
+- Reconciling resources that live on the hosted cluster:
+    * CRDs created by operators that are absent from the hosted cluster (RequestCount CRD created by cluster-kube-apiserver-operator)
+    * Clearing any user changes to the ClusterVersion resource (all updates should be driven via HostedCluster API)
+    * ClusterOperator stubs for control plane components that run outside.
+    * Global Configuration that is managed via the HostedCluster API
+    * Namespaces that are normally created by operators that are absent from the cluster.
+    * RBAC that is normally created by operators that are absent from the cluster.
+    * Registry configuration
+    * Default ingress controller
+    * Control Plane PKI (kubelet serving CA, control plane signer CA)
+    * Konnectivity Agent
+    * OpenShift APIServer resources (APIServices, Service, Endpoints)
+    * OpenShift OAuth APIServer resources (APIServices, Service, Endpoints)
+    * Monitoring Configuration (set node selector to non-master nodes)
+    * Pull Secret
+    * OAuth serving cert CA
+    * OAuthClients required by the console
+    * Cloud Credential Secrets (contain STS role for components that need cloud access)
+    * OLM CatalogSources
+    * OLM PackageServer resources (APIService, Service, Endpoints)
 
 ## Resource dependency diagram
 

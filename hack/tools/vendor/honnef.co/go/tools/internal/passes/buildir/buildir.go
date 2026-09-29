@@ -11,36 +11,37 @@
 package buildir
 
 import (
-	"go/ast"
 	"go/types"
 	"reflect"
 
+	"honnef.co/go/tools/go/ir"
+
 	"golang.org/x/tools/go/analysis"
-	"honnef.co/go/tools/ir"
+	"golang.org/x/tools/go/analysis/passes/ctrlflow"
 )
 
-type willExit struct{}
-type willUnwind struct{}
-
-func (*willExit) AFact()   {}
-func (*willUnwind) AFact() {}
+var Debug = struct {
+	Mode ir.BuilderMode
+}{}
 
 var Analyzer = &analysis.Analyzer{
 	Name:       "buildir",
 	Doc:        "build IR for later passes",
 	Run:        run,
-	ResultType: reflect.TypeOf(new(IR)),
-	FactTypes:  []analysis.Fact{new(willExit), new(willUnwind)},
+	ResultType: reflect.TypeFor[*IR](),
+	Requires:   []*analysis.Analyzer{ctrlflow.Analyzer},
 }
 
 // IR provides intermediate representation for all the
-// non-blank source functions in the current package.
+// source functions in the current package.
 type IR struct {
 	Pkg      *ir.Package
 	SrcFuncs []*ir.Function
 }
 
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
+	cfgs := pass.ResultOf[ctrlflow.Analyzer].(*ctrlflow.CFGs)
+
 	// Plundered from ssautil.BuildPackage.
 
 	// We must create a new Program for each Package because the
@@ -54,8 +55,13 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// to a single Program.
 
 	mode := ir.GlobalDebug
+	if Debug.Mode != 0 {
+		mode = Debug.Mode
+	}
 
 	prog := ir.NewProgram(pass.Fset, mode)
+
+	prog.SetNoReturn(cfgs.NoReturn)
 
 	// Create IR packages for all imports.
 	// Order is not significant.
@@ -65,19 +71,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		for _, p := range pkgs {
 			if !created[p] {
 				created[p] = true
-				irpkg := prog.CreatePackage(p, nil, nil, true)
-				for _, fn := range irpkg.Functions {
-					if ast.IsExported(fn.Name()) {
-						var exit willExit
-						var unwind willUnwind
-						if pass.ImportObjectFact(fn.Object(), &exit) {
-							fn.WillExit = true
-						}
-						if pass.ImportObjectFact(fn.Object(), &unwind) {
-							fn.WillUnwind = true
-						}
-					}
-				}
+				prog.CreatePackage(p, nil, nil, true)
 				createAll(p.Imports())
 			}
 		}
@@ -101,12 +95,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	}
 	for _, fn := range irpkg.Functions {
 		addAnons(fn)
-		if fn.WillExit {
-			pass.ExportObjectFact(fn.Object(), new(willExit))
-		}
-		if fn.WillUnwind {
-			pass.ExportObjectFact(fn.Object(), new(willUnwind))
-		}
 	}
 
 	return &IR{Pkg: irpkg, SrcFuncs: funcs}, nil

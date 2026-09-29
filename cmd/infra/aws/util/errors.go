@@ -3,12 +3,14 @@ package util
 import (
 	"errors"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go-v2/config"
+
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 func IsErrorRetryable(err error) bool {
-	if aggregate, isAggregate := err.(utilerrors.Aggregate); isAggregate {
+	var aggregate utilerrors.Aggregate
+	if errors.As(err, &aggregate) {
 		if len(aggregate.Errors()) == 1 {
 			err = aggregate.Errors()[0]
 		} else {
@@ -36,9 +38,6 @@ func IsErrorRetryable(err error) bool {
 }
 
 func isCredentialLoadError(err error) bool {
-	if awsErr := awserr.Error(nil); errors.As(err, &awsErr) && awsErr.Code() == "SharedCredsLoad" {
-		return true
-	}
-
-	return false
+	var sharedCfgErr config.SharedConfigLoadError
+	return errors.As(err, &sharedCfgErr)
 }

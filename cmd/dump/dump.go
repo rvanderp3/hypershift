@@ -1,9 +1,9 @@
 package dump
 
 import (
-	"github.com/spf13/cobra"
+	clusterdump "github.com/openshift/hypershift/cmd/cluster/dump"
 
-	"github.com/openshift/hypershift/cmd/cluster"
+	"github.com/spf13/cobra"
 )
 
 func NewCommand() *cobra.Command {
@@ -13,7 +13,7 @@ func NewCommand() *cobra.Command {
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(cluster.NewDumpCommand())
+	cmd.AddCommand(clusterdump.NewDumpCommand(clusterdump.DumpClusterWithRetry))
 
 	return cmd
 }

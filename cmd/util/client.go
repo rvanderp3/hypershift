@@ -5,33 +5,91 @@ import (
 	"os"
 	"strings"
 
+	hyperapi "github.com/openshift/hypershift/support/api"
+
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+
 	cr "sigs.k8s.io/controller-runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
-
-	hyperapi "github.com/openshift/hypershift/api"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 const (
 	AutoInfraLabelName = "hypershift.openshift.io/auto-created-for-infra"
+	// DeleteWithClusterLabelName marks CLI created secrets, to be safely removed on hosted cluster deletion
+	DeleteWithClusterLabelName = "hypershift.openshift.io/safe-to-delete-with-cluster"
+
+	KubeconfigFlagHelp = "Path to a kubeconfig file for the management cluster. If not specified, the default kubeconfig resolution is used (KUBECONFIG env var, then in-cluster config, then ~/.kube/config)."
 )
 
-// GetConfigOrDie creates a REST config from current context
-func GetConfigOrDie() *rest.Config {
-	cfg := cr.GetConfigOrDie()
-	cfg.QPS = 100
-	cfg.Burst = 100
-	return cfg
+// GetConfig creates a REST config from current context
+func GetConfig() (*rest.Config, error) {
+	return GetConfigWithKubeconfig("")
 }
 
-// GetClientOrDie creates a controller-runtime client for Kubernetes
-func GetClientOrDie() crclient.Client {
-	client, err := crclient.New(GetConfigOrDie(), crclient.Options{Scheme: hyperapi.Scheme})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to get kubernetes client: %v", err)
-		os.Exit(1)
+// GetConfigWithKubeconfig creates a REST config from the specified kubeconfig file path.
+// If kubeconfigPath is empty, it falls back to the default kubeconfig resolution.
+func GetConfigWithKubeconfig(kubeconfigPath string) (*rest.Config, error) {
+	var cfg *rest.Config
+	var err error
+	if kubeconfigPath == "" {
+		cfg, err = cr.GetConfig()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("unable to build config from kubeconfig %q: %w", kubeconfigPath, err)
+		}
 	}
-	return client
+	cfg.QPS = 100
+	cfg.Burst = 100
+	return cfg, nil
+}
+
+// GetClient creates a controller-runtime client for Kubernetes
+func GetClient() (crclient.Client, error) {
+	return GetClientWithKubeconfig("")
+}
+
+// GetClientWithKubeconfig creates a controller-runtime client for Kubernetes using
+// the specified kubeconfig file path. If kubeconfigPath is empty, it falls back to
+// the default kubeconfig resolution.
+func GetClientWithKubeconfig(kubeconfigPath string) (crclient.Client, error) {
+	if os.Getenv("FAKE_CLIENT") == "true" {
+		return fake.NewFakeClient(), nil
+	}
+
+	config, err := GetConfigWithKubeconfig(kubeconfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes config: %w", err)
+	}
+
+	client, err := crclient.New(config, crclient.Options{Scheme: hyperapi.Scheme})
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes client: %w", err)
+	}
+
+	return client, nil
+}
+
+// GetImpersonatedClient creates a controller-runtime client for Kubernetes
+func GetImpersonatedClient(userName string) (crclient.Client, error) {
+	config, err := GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes config: %w", err)
+	}
+	config.Impersonate = rest.ImpersonationConfig{
+		UserName: userName,
+	}
+
+	client, err := crclient.New(config, crclient.Options{Scheme: hyperapi.Scheme})
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes client: %w", err)
+	}
+	return client, nil
 }
 
 // ParseAWSTags does exactly that

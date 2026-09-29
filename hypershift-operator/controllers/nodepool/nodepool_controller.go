@@ -1,188 +1,277 @@
 package nodepool
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/base64"
-	"encoding/json"
+	coreerrors "errors"
 	"fmt"
-	"hash/fnv"
-	"strconv"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
-	ignitionapi "github.com/coreos/ignition/v2/config/v3_1/types"
-	"github.com/go-logr/logr"
-	"github.com/google/uuid"
-	"github.com/openshift/api/operator/v1alpha1"
-	api "github.com/openshift/hypershift/api"
-	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
-	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
-	hyperutil "github.com/openshift/hypershift/hypershift-operator/controllers/util"
+	haproxy "github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/apiserver-haproxy"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/instancetype"
+	azureinstancetype "github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/instancetype/azure"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/kubevirt"
+	"github.com/openshift/hypershift/hypershift-operator/featuregate"
+	kvinfra "github.com/openshift/hypershift/kubevirtexternalinfra"
+	"github.com/openshift/hypershift/support/awsapi"
+	"github.com/openshift/hypershift/support/capabilities"
+	"github.com/openshift/hypershift/support/images"
+	"github.com/openshift/hypershift/support/k8sutil"
+	"github.com/openshift/hypershift/support/netutil"
+	"github.com/openshift/hypershift/support/reconcilerpolicy"
 	"github.com/openshift/hypershift/support/releaseinfo"
+	"github.com/openshift/hypershift/support/supportedversion"
+	"github.com/openshift/hypershift/support/tracing"
 	"github.com/openshift/hypershift/support/upsert"
-	mcfgv1 "github.com/openshift/hypershift/thirdparty/machineconfigoperator/pkg/apis/machineconfiguration.openshift.io/v1"
-	"github.com/pkg/errors"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/trace"
+	supportutil "github.com/openshift/hypershift/support/util"
+
+	configv1 "github.com/openshift/api/config/v1"
+	agentv1 "github.com/openshift/cluster-api-provider-agent/api/v1beta1"
+
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	serializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	k8sutilspointer "k8s.io/utils/pointer"
-	capiaws "sigs.k8s.io/cluster-api-provider-aws/api/v1alpha4"
-	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"k8s.io/utils/ptr"
+
+	capiaws "sigs.k8s.io/cluster-api-provider-aws/v2/api/v1beta2"
+	capiazure "sigs.k8s.io/cluster-api-provider-azure/api/v1beta1"
+	capiopenstackv1beta1 "sigs.k8s.io/cluster-api-provider-openstack/api/v1beta1"
+	capiv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	"github.com/blang/semver"
+	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
-	finalizer                               = "hypershift.openshift.io/finalizer"
-	autoscalerMaxAnnotation                 = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size"
-	autoscalerMinAnnotation                 = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size"
-	nodePoolAnnotation                      = "hypershift.openshift.io/nodePool"
-	nodePoolAnnotationCurrentConfig         = "hypershift.openshift.io/nodePoolCurrentConfig"
-	nodePoolAnnotationCurrentConfigVersion  = "hypershift.openshift.io/nodePoolCurrentConfigVersion"
-	nodePoolAnnotationCurrentProviderConfig = "hypershift.openshift.io/nodePoolCurrentProviderConfig"
-	nodePoolCoreIgnitionConfigLabel         = "hypershift.openshift.io/core-ignition-config"
-	TokenSecretReleaseKey                   = "release"
-	TokenSecretTokenKey                     = "token"
-	TokenSecretConfigKey                    = "config"
-	TokenSecretAnnotation                   = "hypershift.openshift.io/ignition-config"
+	finalizer                                = "hypershift.openshift.io/finalizer"
+	autoscalerMaxAnnotation                  = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size"
+	autoscalerMinAnnotation                  = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size"
+	nodePoolAnnotation                       = "hypershift.openshift.io/nodePool"
+	nodePoolAnnotationCurrentConfig          = "hypershift.openshift.io/nodePoolCurrentConfig"
+	nodePoolAnnotationCurrentConfigVersion   = "hypershift.openshift.io/nodePoolCurrentConfigVersion"
+	nodePoolAnnotationTargetConfigVersion    = "hypershift.openshift.io/nodePoolTargetConfigVersion"
+	nodePoolAnnotationUpgradeInProgressTrue  = "hypershift.openshift.io/nodePoolUpgradeInProgressTrue"
+	nodePoolAnnotationUpgradeInProgressFalse = "hypershift.openshift.io/nodePoolUpgradeInProgressFalse"
+	nodePoolAnnotationMaxUnavailable         = "hypershift.openshift.io/nodePoolMaxUnavailable"
+
+	// ec2InstanceMetadataHTTPTokensAnnotation can be set to change the instance metadata options of the nodepool underlying EC2 instances
+	// possible values are 'required' (i.e. IMDSv2) or 'optional' which is the default.
+	ec2InstanceMetadataHTTPTokensAnnotation = "hypershift.openshift.io/ec2-instance-metadata-http-tokens"
+
+	nodePoolAnnotationPlatformMachineTemplate = "hypershift.openshift.io/nodePoolPlatformMachineTemplate"
+	nodePoolAnnotationTaints                  = "hypershift.openshift.io/nodePoolTaints"
+	// nodePoolAnnotationCanonicalDataPlaneImages gates the use of canonical
+	// (pre-override) image references for data plane static pods. Set automatically
+	// on new NodePools and during version upgrades to avoid triggering rollouts on
+	// existing stable NodePools.
+	nodePoolAnnotationCanonicalDataPlaneImages = "hypershift.openshift.io/canonical-data-plane-images"
+	nodePoolCoreIgnitionConfigLabel            = "hypershift.openshift.io/core-ignition-config"
+
+	tuningConfigKey                                      = "tuning"
+	tunedConfigMapLabel                                  = "hypershift.openshift.io/tuned-config"
+	nodeTuningGeneratedConfigLabel                       = "hypershift.openshift.io/nto-generated-machine-config"
+	PerformanceProfileConfigMapLabel                     = "hypershift.openshift.io/performanceprofile-config"
+	NodeTuningGeneratedPerformanceProfileStatusLabel     = "hypershift.openshift.io/nto-generated-performance-profile-status"
+	ContainerRuntimeConfigConfigMapLabel                 = "hypershift.openshift.io/containerruntimeconfig-config"
+	controlPlaneOperatorManagesDecompressAndDecodeConfig = "io.openshift.hypershift.control-plane-operator-manages.decompress-decode-config"
+
+	controlPlaneOperatorCreatesDefaultAWSSecurityGroup = "io.openshift.hypershift.control-plane-operator-creates-aws-sg"
+
+	labelManagedPrefix = "managed.hypershift.openshift.io"
 )
 
 type NodePoolReconciler struct {
 	client.Client
 	recorder        record.EventRecorder
 	ReleaseProvider releaseinfo.Provider
-
-	tracer trace.Tracer
-
 	upsert.CreateOrUpdateProvider
+	HypershiftOperatorImage string
+	ImageMetadataProvider   supportutil.ImageMetadataProvider
+	KubevirtInfraClients    kvinfra.KubevirtInfraClientMap
+	EC2Client               awsapi.EC2API
+	InstanceTypeProvider    instancetype.Provider
+	ScaleFromZeroPlatform   hyperv1.PlatformType
+	resolveDNSHostname      func(context.Context, string) error
+}
+
+type NotReadyError struct {
+	error
+}
+
+type CPOCapabilities struct {
+	DecompressAndDecodeConfig     bool
+	CreateDefaultAWSSecurityGroup bool
+}
+
+// when using the conditions.SetSummary, with the WithStepCounter or WithStepCounterIf(true) options,
+// the result Ready condition message is something like "1 of 2 completed". If we want to use this kind
+// of messages for our own condition message, this is not useful. This regexp finds these condition messages
+var isSetupCounterCondMessage = regexp.MustCompile(`\d+ of \d+ completed`)
+
+var capiRelatedNodePoolManagedResourcesToWatch = []client.Object{
+	&capiaws.AWSMachineTemplate{},
+	&capiazure.AzureMachineTemplate{},
+	&agentv1.AgentMachineTemplate{},
+	&capiopenstackv1beta1.OpenStackMachineTemplate{},
 }
 
 func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	_, err := ctrl.NewControllerManagedBy(mgr).
-		For(&hyperv1.NodePool{}).
+	bldr := ctrl.NewControllerManagedBy(mgr).
+		For(&hyperv1.NodePool{}, builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
 		// We want to reconcile when the HostedCluster IgnitionEndpoint is available.
-		Watches(&source.Kind{Type: &hyperv1.HostedCluster{}}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForHostedCluster)).
-		Watches(&source.Kind{Type: &capiv1.MachineDeployment{}}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool)).
-		Watches(&source.Kind{Type: &capiaws.AWSMachineTemplate{}}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool)).
+		Watches(&hyperv1.HostedCluster{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForHostedCluster), builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
+		Watches(&capiv1.MachineDeployment{}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool), builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
+		Watches(&capiv1.MachineSet{}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool), builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
+		Watches(&capiv1.MachineHealthCheck{}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool), builder.WithPredicates(predicate.And(mhcRemediationAllowedChangedPredicate(), reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient())))).
 		// We want to reconcile when the user data Secret or the token Secret is unexpectedly changed out of band.
-		Watches(&source.Kind{Type: &corev1.Secret{}}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool), builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
 		// We want to reconcile when the ConfigMaps referenced by the spec.config and also the core ones change.
-		Watches(&source.Kind{Type: &corev1.ConfigMap{}}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForConfig)).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForConfig), builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
+		// We want to reconcile when cloud provider config ConfigMaps change in the control plane namespace.
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForCloudConfig), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetName() == "azure-cloud-config" || obj.GetName() == "openstack-cloud-config"
+		}))).
 		WithOptions(controller.Options{
-			RateLimiter: workqueue.NewItemExponentialFailureRateLimiter(1*time.Second, 10*time.Second),
+			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 10*time.Second),
+			MaxConcurrentReconciles: 10,
+		})
+	for _, managedResource := range r.managedResources() {
+		bldr.Watches(managedResource, handler.EnqueueRequestsFromMapFunc(enqueueParentNodePool), builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient())))
+	}
+	if err := bldr.Complete(r); err != nil {
+		return errors.Wrap(err, "failed setting up with a controller manager")
+	}
+
+	if err := ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Secret{}, builder.WithPredicates(reconcilerpolicy.PredicatesForHostedClusterAnnotationScoping(mgr.GetClient()))).
+		WithOptions(controller.Options{
+			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](1*time.Second, 10*time.Second),
+			MaxConcurrentReconciles: 10,
 		}).
-		Build(r)
-	if err != nil {
+		Complete(&secretJanitor{
+			NodePoolReconciler: r,
+		}); err != nil {
 		return errors.Wrap(err, "failed setting up with a controller manager")
 	}
 
 	r.recorder = mgr.GetEventRecorderFor("nodepool-controller")
-	r.tracer = otel.Tracer("nodepool-controller")
 
 	return nil
 }
 
-func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ctx = baggage.ContextWithValues(ctx,
-		attribute.String("request", req.String()),
-	)
-	var span trace.Span
-	ctx, span = r.tracer.Start(ctx, "reconcile")
-	defer span.End()
+// managedResources are all the resources that are managed as childresources for a HostedCluster
+func (r *NodePoolReconciler) managedResources() []client.Object {
+	var managedResources []client.Object
 
+	if platformsInstalled := os.Getenv("PLATFORMS_INSTALLED"); len(platformsInstalled) > 0 {
+		// Watch based on platforms installed
+		managedResources = append(managedResources, k8sutil.GetNodePoolManagedResources(platformsInstalled)...)
+	} else {
+		// Watch all CAPI platform related resources
+		managedResources = append(managedResources, capiRelatedNodePoolManagedResourcesToWatch...)
+	}
+
+	return managedResources
+}
+
+var nodePoolTracer = tracing.Tracer("nodepool")
+
+func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	log := ctrl.LoggerFrom(ctx)
-	log.Info("Reconciling")
 
 	// Fetch the nodePool instance
 	nodePool := &hyperv1.NodePool{}
-	err := r.Client.Get(ctx, req.NamespacedName, nodePool)
+	err = r.Client.Get(ctx, req.NamespacedName, nodePool)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("not found", "request", req.String())
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "error getting nodePool")
+		log.Error(err, "error getting nodepool")
 		return ctrl.Result{}, err
+	}
+
+	startOpts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			tracing.AttrNodePoolName.String(nodePool.Name),
+			tracing.AttrNodePoolNamespace.String(nodePool.Namespace),
+			tracing.AttrNodePoolClusterName.String(nodePool.Spec.ClusterName),
+		),
+	}
+	if link := tracing.SpanLinkFromAnnotations(nodePool.Annotations); link.SpanContext.IsValid() {
+		startOpts = append(startOpts, trace.WithLinks(link))
+	}
+	ctx, span := nodePoolTracer.Start(ctx, tracing.SpanNodePoolReconcile, startOpts...)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	if nodePool.Spec.Release.Image != "" {
+		span.SetAttributes(tracing.AttrNodePoolReleaseImage.String(nodePool.Spec.Release.Image))
+	}
+	if !nodePool.DeletionTimestamp.IsZero() {
+		span.SetAttributes(tracing.AttrNodePoolDeleting.Bool(true))
+	}
+
+	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(nodePool.Namespace, nodePool.Spec.ClusterName)
+
+	// If deleted, clean up and return early.
+	if !nodePool.DeletionTimestamp.IsZero() {
+		if err := r.delete(ctx, nodePool, controlPlaneNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to delete nodepool: %w", err)
+		}
+
+		// Now we can remove the finalizer.
+		if controllerutil.ContainsFinalizer(nodePool, finalizer) {
+			controllerutil.RemoveFinalizer(nodePool, finalizer)
+			if err := r.Update(ctx, nodePool); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from nodepool: %w", err)
+			}
+		}
+
+		log.Info("Deleted nodepool", "name", req.NamespacedName)
+		return ctrl.Result{}, nil
 	}
 
 	hcluster, err := GetHostedClusterByName(ctx, r.Client, nodePool.GetNamespace(), nodePool.Spec.ClusterName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hcluster.Namespace, hcluster.Name).Name
 
-	md := machineDeployment(nodePool, hcluster.Spec.InfraID, controlPlaneNamespace)
-	mhc := machineHealthCheck(nodePool, controlPlaneNamespace)
-
-	if !nodePool.DeletionTimestamp.IsZero() {
-		span.AddEvent("Deleting nodePool")
-		awsMachineTemplates, err := r.listAWSMachineTemplates(nodePool)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("failed to list AWSMachineTemplates: %w", err)
-		}
-		for k := range awsMachineTemplates {
-			if err := r.Delete(ctx, &awsMachineTemplates[k]); err != nil && !apierrors.IsNotFound(err) {
-				return reconcile.Result{}, fmt.Errorf("failed to delete AWSMachineTemplate: %w", err)
-			}
-		}
-
-		// Delete any secret belonging to this NodePool i.e token Secret and userdata Secret.
-		secrets, err := r.listSecrets(nodePool)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("failed to list secrets: %w", err)
-		}
-		for k := range secrets {
-			if err := r.Delete(ctx, &secrets[k]); err != nil && !apierrors.IsNotFound(err) {
-				return reconcile.Result{}, fmt.Errorf("failed to delete secret: %w", err)
-			}
-		}
-
-		if err := r.Delete(ctx, md); err != nil && !apierrors.IsNotFound(err) {
-			return reconcile.Result{}, fmt.Errorf("failed to delete MachineDeployment: %w", err)
-		}
-
-		if err := r.Client.Delete(ctx, mhc); err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("failed to delete MachineHealthCheck: %w", err)
-		}
-
-		if controllerutil.ContainsFinalizer(nodePool, finalizer) {
-			controllerutil.RemoveFinalizer(nodePool, finalizer)
-			if err := r.Update(ctx, nodePool); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from NodePool: %w", err)
-			}
-		}
-		log.Info("Deleted nodePool")
-		span.AddEvent("Finished deleting nodePool")
-		return ctrl.Result{}, nil
+	if hcluster.Spec.InfraID != "" {
+		span.SetAttributes(tracing.CorrelationAttrs(hcluster.Spec.InfraID)...)
 	}
 
 	// Ensure the nodePool has a finalizer for cleanup
 	if !controllerutil.ContainsFinalizer(nodePool, finalizer) {
 		controllerutil.AddFinalizer(nodePool, finalizer)
 		if err := r.Update(ctx, nodePool); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to add finalizer to nodePool: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to add finalizer to nodepool: %w", err)
 		}
 	}
 
@@ -192,7 +281,7 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	result, err := r.reconcile(ctx, hcluster, nodePool)
+	result, err = r.reconcile(ctx, hcluster, nodePool)
 	if err != nil {
 		log.Error(err, "Failed to reconcile NodePool")
 		r.recorder.Eventf(nodePool, corev1.EventTypeWarning, "ReconcileError", "%v", err)
@@ -203,22 +292,18 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return result, err
 	}
 
-	span.AddEvent("Updating nodePool")
 	if err := patchHelper.Patch(ctx, nodePool); err != nil {
 		log.Error(err, "failed to patch")
 		return ctrl.Result{}, fmt.Errorf("failed to patch: %w", err)
 	}
 
 	log.Info("Successfully reconciled")
-	return ctrl.Result{}, nil
+	return result, nil
 }
 
+//nolint:gocyclo
 func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.HostedCluster, nodePool *hyperv1.NodePool) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-
-	var span trace.Span
-	ctx, span = r.tracer.Start(ctx, "update")
-	defer span.End()
 
 	// HostedCluster owns NodePools. This should ensure orphan NodePools are garbage collected when cascading deleting.
 	nodePool.OwnerReferences = util.EnsureOwnerRef(nodePool.OwnerReferences, metav1.OwnerReference{
@@ -228,701 +313,394 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		UID:        hcluster.UID,
 	})
 
-	// Get HostedCluster deps.
-	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hcluster.Namespace, hcluster.Name).Name
-	ignEndpoint := hcluster.Status.IgnitionEndpoint
-	infraID := hcluster.Spec.InfraID
-
-	// 1. - Reconcile conditions according to current state of the world.
-
-	// Validate autoscaling input.
-	if err := validateAutoscaling(nodePool); err != nil {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolAutoscalingEnabledConditionType,
-			Status:             metav1.ConditionFalse,
-			Message:            err.Error(),
-			Reason:             hyperv1.NodePoolValidationFailedConditionReason,
-			ObservedGeneration: nodePool.Generation,
-		})
-		// We don't return the error here as reconciling won't solve the input problem.
-		// An update event will trigger reconciliation.
-		log.Error(err, "validating autoscaling parameters failed")
-		return reconcile.Result{}, nil
-	}
-	if isAutoscalingEnabled(nodePool) {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolAutoscalingEnabledConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-			Message:            fmt.Sprintf("Maximum nodes: %v, Minimum nodes: %v", nodePool.Spec.AutoScaling.Max, nodePool.Spec.AutoScaling.Min),
-			ObservedGeneration: nodePool.Generation,
-		})
-	} else {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolAutoscalingEnabledConditionType,
-			Status:             metav1.ConditionFalse,
-			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-			ObservedGeneration: nodePool.Generation,
-		})
-	}
-
-	// Validate management input.
-	if err := validateManagement(nodePool); err != nil {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolUpdateManagementEnabledConditionType,
-			Status:             metav1.ConditionFalse,
-			Message:            err.Error(),
-			Reason:             hyperv1.NodePoolValidationFailedConditionReason,
-			ObservedGeneration: nodePool.Generation,
-		})
-		// We don't return the error here as reconciling won't solve the input problem.
-		// An update event will trigger reconciliation.
-		log.Error(err, "validating management parameters failed")
-		return reconcile.Result{}, nil
-	}
-	meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-		Type:               hyperv1.NodePoolUpdateManagementEnabledConditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-		ObservedGeneration: nodePool.Generation,
-	})
-
-	// Validate IgnitionEndpoint.
-	if ignEndpoint == "" {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               string(hyperv1.IgnitionEndpointAvailable),
-			Status:             metav1.ConditionFalse,
-			Message:            "Ignition endpoint not available, waiting",
-			Reason:             hyperv1.IgnitionEndpointMissingReason,
-			ObservedGeneration: nodePool.Generation,
-		})
-		log.Info("Ignition endpoint not available, waiting")
-		return reconcile.Result{}, nil
-	}
-	RemoveStatusCondition(&nodePool.Status.Conditions, string(hyperv1.IgnitionEndpointAvailable))
-
-	// Validate Ignition CA Secret.
-	caSecret := ignitionserver.IgnitionCACertSecret(controlPlaneNamespace)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(caSecret), caSecret); err != nil {
-		if apierrors.IsNotFound(err) {
-			meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-				Type:               string(hyperv1.IgnitionEndpointAvailable),
-				Status:             metav1.ConditionFalse,
-				Reason:             hyperv1.IgnitionCACertMissingReason,
-				Message:            "still waiting for ignition CA cert Secret to exist",
-				ObservedGeneration: nodePool.Generation,
-			})
-			log.Info("still waiting for ignition CA cert Secret to exist")
-			return ctrl.Result{}, nil
-		} else {
-			return ctrl.Result{}, fmt.Errorf("failed to get ignition CA Secret: %w", err)
-		}
-	}
-	RemoveStatusCondition(&nodePool.Status.Conditions, string(hyperv1.IgnitionEndpointAvailable))
-
-	caCertBytes, hasCACert := caSecret.Data[corev1.TLSCertKey]
-	if !hasCACert {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               string(hyperv1.IgnitionEndpointAvailable),
-			Status:             metav1.ConditionFalse,
-			Reason:             hyperv1.IgnitionCACertMissingReason,
-			Message:            "CA Secret is missing tls.crt key",
-			ObservedGeneration: nodePool.Generation,
-		})
-		log.Info("CA Secret is missing tls.crt key")
-		return ctrl.Result{}, nil
-	}
-	RemoveStatusCondition(&nodePool.Status.Conditions, hyperv1.IgnitionCACertMissingReason)
-
-	// Validate and get releaseImage.
-	releaseImage, err := r.getReleaseImage(ctx, hcluster, nodePool.Spec.Release.Image)
-	if err != nil {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolValidReleaseImageConditionType,
-			Status:             metav1.ConditionFalse,
-			Reason:             hyperv1.NodePoolValidationFailedConditionReason,
-			Message:            fmt.Sprintf("Failed to get release image: %v", err.Error()),
-			ObservedGeneration: nodePool.Generation,
-		})
-		return ctrl.Result{}, fmt.Errorf("failed to look up release image metadata: %w", err)
-	}
-	meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-		Type:               hyperv1.NodePoolValidReleaseImageConditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-		Message:            fmt.Sprintf("Using release image: %s", nodePool.Spec.Release.Image),
-		ObservedGeneration: nodePool.Generation,
-	})
-
-	// Validate platform specific input.
-	var ami string
-	if nodePool.Spec.Platform.Type == hyperv1.AWSPlatform {
-		if hcluster.Spec.Platform.AWS == nil {
-			return ctrl.Result{}, fmt.Errorf("the HostedCluster for this NodePool has no .Spec.Platform.AWS, this is unsupported")
-		}
-		// TODO: Should the region be included in the NodePool platform information?
-		ami, err = getAMI(nodePool, hcluster.Spec.Platform.AWS.Region, releaseImage)
-		if err != nil {
-			meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-				Type:               hyperv1.NodePoolValidAMIConditionType,
-				Status:             metav1.ConditionFalse,
-				Reason:             hyperv1.NodePoolValidationFailedConditionReason,
-				Message:            fmt.Sprintf("Couldn't discover an AMI for release image %q: %s", nodePool.Spec.Release.Image, err.Error()),
-				ObservedGeneration: nodePool.Generation,
-			})
-			return ctrl.Result{}, fmt.Errorf("couldn't discover an AMI for release image: %w", err)
-		}
-	}
-	meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-		Type:               hyperv1.NodePoolValidAMIConditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-		Message:            fmt.Sprintf("Bootstrap AMI is %q", ami),
-		ObservedGeneration: nodePool.Generation,
-	})
-
-	// Validate config input.
-	// 3 generic core config resoures: fips, ssh and haproxy.
-	// TODO (alberto): consider moving the expectedCoreConfigResources check
-	// into the token Secret controller so we don't block Machine infra creation on this.
-	expectedCoreConfigResources := 3
-	if len(hcluster.Spec.ImageContentSources) > 0 {
-		// additional core config resource created when image content source specified.
-		expectedCoreConfigResources += 1
-	}
-	config, err := r.getConfig(ctx, nodePool, expectedCoreConfigResources, controlPlaneNamespace)
-	if err != nil {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolConfigValidConfigConditionType,
-			Status:             metav1.ConditionFalse,
-			Reason:             hyperv1.NodePoolValidationFailedConditionReason,
-			Message:            err.Error(),
-			ObservedGeneration: nodePool.Generation,
-		})
-		return ctrl.Result{}, fmt.Errorf("failed to get config: %w", err)
-	}
-	meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-		Type:               hyperv1.NodePoolConfigValidConfigConditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-		ObservedGeneration: nodePool.Generation,
-	})
-
-	// Check if config needs to be updated.
-	targetConfigHash := hashStruct(config)
-	isUpdatingConfig := isUpdatingConfig(nodePool, targetConfigHash)
-	if isUpdatingConfig {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolUpdatingConfigConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-			Message:            fmt.Sprintf("Updating config in progress. Target config: %s", targetConfigHash),
-			ObservedGeneration: nodePool.Generation,
-		})
-		log.Info("NodePool config is updating",
-			"current", nodePool.GetAnnotations()[nodePoolAnnotationCurrentConfig],
-			"target", targetConfigHash)
-	} else {
-		RemoveStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolUpdatingConfigConditionType)
-	}
-
-	// Check if version needs to be updated.
-	targetVersion := releaseImage.Version()
-	isUpdatingVersion := isUpdatingVersion(nodePool, targetVersion)
-	if isUpdatingVersion {
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolUpdatingVersionConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-			Message:            fmt.Sprintf("Updating version in progress. Target version: %s", targetVersion),
-			ObservedGeneration: nodePool.Generation,
-		})
-		log.Info("NodePool version is updating",
-			"current", nodePool.Status.Version, "target", targetVersion)
-	} else {
-		RemoveStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolUpdatingVersionConditionType)
-	}
-
-	// 2. - Reconcile towards expected state of the world.
-	targetConfigVersionHash := hashStruct(config + targetVersion)
-	compressedConfig, err := compress([]byte(config))
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to compress config: %w", err)
-	}
-
-	// Token Secrets are immutable and follow "prefixName-configVersionHash" naming convention.
-	// Ensure old configVersionHash resources are deleted, i.e token Secret and userdata Secret.
-	if isUpdatingVersion || isUpdatingConfig {
-		tokenSecret := TokenSecret(controlPlaneNamespace, nodePool.Name, nodePool.GetAnnotations()[nodePoolAnnotationCurrentConfigVersion])
-		if err := r.Delete(ctx, tokenSecret); err != nil && !apierrors.IsNotFound(err) {
-			return reconcile.Result{}, fmt.Errorf("failed to delete token Secret: %w", err)
-		}
-
-		userDataSecret := IgnitionUserDataSecret(controlPlaneNamespace, nodePool.GetName(), nodePool.GetAnnotations()[nodePoolAnnotationCurrentConfigVersion])
-		if err := r.Delete(ctx, userDataSecret); err != nil && !apierrors.IsNotFound(err) {
-			return reconcile.Result{}, fmt.Errorf("failed to delete token Secret: %w", err)
-		}
-	}
-
-	tokenSecret := TokenSecret(controlPlaneNamespace, nodePool.Name, targetConfigVersionHash)
-	if result, err := r.CreateOrUpdate(ctx, r.Client, tokenSecret, func() error {
-		return reconcileTokenSecret(tokenSecret, nodePool, compressedConfig)
-	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to reconcile token Secret: %w", err)
-	} else {
-		log.Info("Reconciled token Secret", "result", result)
-		span.AddEvent("reconciled token Secret", trace.WithAttributes(attribute.String("result", string(result))))
-	}
-
-	tokenBytes, hasToken := tokenSecret.Data[TokenSecretTokenKey]
-	if !hasToken {
-		// This should never happen by design.
-		return ctrl.Result{}, fmt.Errorf("token secret is missing token key")
-	}
-
-	userDataSecret := IgnitionUserDataSecret(controlPlaneNamespace, nodePool.GetName(), targetConfigVersionHash)
-	if result, err := r.CreateOrUpdate(ctx, r.Client, userDataSecret, func() error {
-		return reconcileUserDataSecret(userDataSecret, nodePool, caCertBytes, tokenBytes, ignEndpoint)
-	}); err != nil {
-		return ctrl.Result{}, err
-	} else {
-		log.Info("Reconciled userData Secret", "result", result)
-		span.AddEvent("reconciled ignition user data secret", trace.WithAttributes(attribute.String("result", string(result))))
-	}
-
-	var machineTemplate client.Object
-	switch nodePool.Spec.Platform.Type {
-	case hyperv1.AWSPlatform:
-		machineTemplate, err = r.reconcileAWSMachineTemplate(ctx, hcluster, nodePool, infraID, ami, controlPlaneNamespace)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to reconcile AWSMachineTemplate: %w", err)
-		}
-		span.AddEvent("reconciled awsmachinetemplate", trace.WithAttributes(attribute.String("name", machineTemplate.GetName())))
-	case hyperv1.NonePlatform:
-		// TODO: When fleshing out platform None design revisit the right semantic to signal this as conditions in a NodePool.
-		return ctrl.Result{}, nil
-	}
-
-	md := machineDeployment(nodePool, infraID, controlPlaneNamespace)
-	if result, err := controllerutil.CreateOrPatch(ctx, r.Client, md, func() error {
-		return r.reconcileMachineDeployment(
-			log,
-			md, nodePool,
-			userDataSecret,
-			machineTemplate,
-			infraID,
-			targetVersion, targetConfigHash, targetConfigVersionHash)
-	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to reconcile MachineDeployment %q: %w",
-			client.ObjectKeyFromObject(md).String(), err)
-	} else {
-		log.Info("Reconciled MachineDeployment", "result", result)
-		span.AddEvent("reconciled machinedeployment", trace.WithAttributes(attribute.String("result", string(result))))
-	}
-
-	mhc := machineHealthCheck(nodePool, controlPlaneNamespace)
-	if nodePool.Spec.Management.AutoRepair {
-		if result, err := ctrl.CreateOrUpdate(ctx, r.Client, mhc, func() error {
-			return r.reconcileMachineHealthCheck(mhc, nodePool, infraID)
-		}); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to reconcile MachineHealthCheck %q: %w",
-				client.ObjectKeyFromObject(mhc).String(), err)
-		} else {
-			log.Info("Reconciled MachineHealthCheck", "result", result)
-			span.AddEvent("reconciled machinehealthchecks", trace.WithAttributes(attribute.String("result", string(result))))
-		}
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolAutorepairEnabledConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-			ObservedGeneration: nodePool.Generation,
-		})
-	} else {
-		if err := r.Client.Delete(ctx, mhc); err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		} else {
-			span.AddEvent("deleted machinehealthcheck", trace.WithAttributes(attribute.String("name", mhc.Name)))
-		}
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               hyperv1.NodePoolAutorepairEnabledConditionType,
-			Status:             metav1.ConditionFalse,
-			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
-			ObservedGeneration: nodePool.Generation,
-		})
-	}
-
-	return ctrl.Result{}, nil
-}
-
-func (r NodePoolReconciler) reconcileAWSMachineTemplate(ctx context.Context,
-	hostedCluster *hyperv1.HostedCluster,
-	nodePool *hyperv1.NodePool,
-	infraID string,
-	ami string,
-	controlPlaneNamespace string,
-) (*capiaws.AWSMachineTemplate, error) {
-
-	log := ctrl.LoggerFrom(ctx)
-	// Get target template and hash.
-	targetAWSMachineTemplate, targetTemplateHash := AWSMachineTemplate(infraID, ami, hostedCluster, nodePool, controlPlaneNamespace)
-
-	// Get current template and hash.
-	currentTemplateHash := nodePool.GetAnnotations()[nodePoolAnnotationCurrentProviderConfig]
-	currentAWSMachineTemplate := &capiaws.AWSMachineTemplate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-%s", nodePool.GetName(), currentTemplateHash),
-			Namespace: controlPlaneNamespace,
-		},
-	}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(currentAWSMachineTemplate), currentAWSMachineTemplate); err != nil && !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("error getting existing AWSMachineTemplate: %w", err)
-	}
-
-	// Template has not changed, return early.
-	// TODO(alberto): can we hash in a deterministic way so we could just compare hashes?
-	if equality.Semantic.DeepEqual(currentAWSMachineTemplate.Spec.Template.Spec, targetAWSMachineTemplate.Spec.Template.Spec) {
-		return currentAWSMachineTemplate, nil
-	}
-
-	// Otherwise create new template.
-	log.Info("The AWSMachineTemplate referenced by this NodePool has changed. Creating a new one")
-	if err := r.Create(ctx, targetAWSMachineTemplate); err != nil {
-		return nil, fmt.Errorf("error creating new AWSMachineTemplate: %w", err)
-	}
-
-	// TODO (alberto): Create a mechanism to cleanup old machineTemplates.
-	// We can't just delete the old AWSMachineTemplate because
-	// this would break the rolling upgrade process since the MachineSet
-	// being scaled down is still referencing the old AWSMachineTemplate.
-	// May be consider one single template the whole NodePool lifecycle. Modify it in place
-	// and trigger rolling update by e.g annotating the machineDeployment.
-
-	// Store new template hash.
+	// Initialize NodePool annotations
 	if nodePool.Annotations == nil {
 		nodePool.Annotations = make(map[string]string)
 	}
-	nodePool.Annotations[nodePoolAnnotationCurrentProviderConfig] = targetTemplateHash
 
-	return targetAWSMachineTemplate, nil
-}
+	// Get HostedCluster deps.
+	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hcluster.Namespace, hcluster.Name)
+	infraID := hcluster.Spec.InfraID
 
-func reconcileUserDataSecret(userDataSecret *corev1.Secret, nodePool *hyperv1.NodePool, CA, token []byte, ignEndpoint string) error {
-	// The token secret controller deletes expired token Secrets.
-	// When that happens the NodePool controller reconciles and create a new one.
-	// Then it reconciles the userData Secret with the new generated token.
-	// Therefore this secret is mutable.
-	userDataSecret.Immutable = k8sutilspointer.BoolPtr(false)
-
-	if userDataSecret.Annotations == nil {
-		userDataSecret.Annotations = make(map[string]string)
-	}
-	userDataSecret.Annotations[nodePoolAnnotation] = client.ObjectKeyFromObject(nodePool).String()
-
-	encodedCACert := base64.StdEncoding.EncodeToString(CA)
-	encodedToken := base64.StdEncoding.EncodeToString(token)
-	ignConfig := ignConfig(encodedCACert, encodedToken, ignEndpoint)
-	userDataValue, err := json.Marshal(ignConfig)
+	// Fetch machines once for all status aggregations that need them.
+	machines, err := r.getMachinesForNodePool(ctx, nodePool)
 	if err != nil {
-		return fmt.Errorf("failed to marshal ignition config: %w", err)
-	}
-	userDataSecret.Data = map[string][]byte{
-		"disableTemplating": []byte(base64.StdEncoding.EncodeToString([]byte("true"))),
-		"value":             userDataValue,
-	}
-	return nil
-}
+		log.Error(err, "Failed to get Machines for status aggregation")
+	} else {
+		// Aggregate node version and health information into NodesInfo status.
+		// This is done before the conditions loop so that nodesInfo stays accurate
+		// even when later validations (e.g. release image) short-circuit the reconcile.
+		r.setNodesInfoStatus(nodePool, machines)
 
-func reconcileTokenSecret(tokenSecret *corev1.Secret, nodePool *hyperv1.NodePool, compressedConfig []byte) error {
-	tokenSecret.Immutable = k8sutilspointer.BoolPtr(true)
-	if tokenSecret.Annotations == nil {
-		tokenSecret.Annotations = make(map[string]string)
+		// Infer the observed RHEL stream from Machine NodeInfo.OSImage and set
+		// status.osImageStream when a majority of machines report a consistent stream.
+		r.setOSImageStreamStatus(nodePool, machines)
 	}
 
-	tokenSecret.Annotations[TokenSecretAnnotation] = "true"
-	tokenSecret.Annotations[nodePoolAnnotation] = client.ObjectKeyFromObject(nodePool).String()
-
-	if tokenSecret.Data == nil {
-		tokenSecret.Data = map[string][]byte{}
-		tokenSecret.Data[TokenSecretTokenKey] = []byte(uuid.New().String())
-		tokenSecret.Data[TokenSecretReleaseKey] = []byte(nodePool.Spec.Release.Image)
-		tokenSecret.Data[TokenSecretConfigKey] = compressedConfig
+	// Loop over all conditions.
+	// Order matter as conditions might choose to short circuit returning ctrl.Result or error.
+	signalConditions := []func(ctx context.Context, nodePool *hyperv1.NodePool, hcluster *hyperv1.HostedCluster) (*ctrl.Result, error){
+		r.autoscalerEnabledCondition,
+		r.updateManagementEnabledCondition,
+		r.releaseImageCondition,
+		r.ignitionEndpointAvailableCondition,
+		r.validArchPlatformCondition,
+		r.reconciliationActiveCondition,
+		// Conditition that depends on a valid release image.
+		r.supportedVersionSkewCondition,
+		r.validMachineConfigCondition,
+		r.updatingConfigCondition,
+		r.updatingVersionCondition,
+		// Conditition that depends on a valid config/token.
+		r.validGeneratedPayloadCondition,
+		r.reachedIgnitionEndpointCondition,
+		r.machineAndNodeConditions,
+		r.validPlatformConfigCondition,
+		// TODO(alberto): consider moving here:
+		// NodePoolUpdatingPlatformMachineTemplateConditionType,
+		// NodePoolAutorepairEnabledConditionType.
 	}
-	return nil
-}
-
-func (r *NodePoolReconciler) reconcileMachineDeployment(log logr.Logger,
-	machineDeployment *capiv1.MachineDeployment,
-	nodePool *hyperv1.NodePool,
-	userDataSecret *corev1.Secret,
-	machineTemplateCR client.Object,
-	CAPIClusterName string,
-	targetVersion,
-	targetConfigHash, targetConfigVersionHash string) error {
-
-	// Set annotations and labels
-	if machineDeployment.GetAnnotations() == nil {
-		machineDeployment.Annotations = map[string]string{}
+	for _, f := range signalConditions {
+		result, err := f(ctx, nodePool, hcluster)
+		if err != nil {
+			if result == nil {
+				return ctrl.Result{}, err
+			}
+			return *result, err
+		}
+		if result != nil {
+			return *result, nil
+		}
 	}
-	machineDeployment.Annotations[nodePoolAnnotation] = client.ObjectKeyFromObject(nodePool).String()
-	if machineDeployment.GetLabels() == nil {
-		machineDeployment.Labels = map[string]string{}
+
+	// Additional short circuiting validations:
+	// TODO(alberto): capture these in conditions.
+	// Consider having a condition "Degraded" with buckets for error types, e.g. INTERNAL_ERR, INFRA_ERR...
+	if err := validateInfraID(infraID); err != nil {
+		// We don't return the error here as reconciling won't solve the input problem.
+		// An update event will trigger reconciliation.
+		log.Error(err, "Invalid infraID, waiting.")
+		return ctrl.Result{}, nil
 	}
-	machineDeployment.Labels[capiv1.ClusterLabelName] = CAPIClusterName
-
-	resourcesName := generateName(CAPIClusterName, nodePool.Spec.ClusterName, nodePool.GetName())
-	machineDeployment.Spec.MinReadySeconds = k8sutilspointer.Int32Ptr(int32(0))
-
-	gvk, err := apiutil.GVKForObject(machineTemplateCR, api.Scheme)
+	// Retrieve pull secret name to check for changes when config is checked for updates
+	_, err = r.getPullSecretName(ctx, hcluster)
 	if err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
-
-	// Set selector and template
-	machineDeployment.Spec.ClusterName = CAPIClusterName
-	if machineDeployment.Spec.Selector.MatchLabels == nil {
-		machineDeployment.Spec.Selector.MatchLabels = map[string]string{}
-	}
-	machineDeployment.Spec.Selector.MatchLabels[resourcesName] = resourcesName
-	machineDeployment.Spec.Template = capiv1.MachineTemplateSpec{
-		ObjectMeta: capiv1.ObjectMeta{
-			Labels: map[string]string{
-				resourcesName:           resourcesName,
-				capiv1.ClusterLabelName: CAPIClusterName,
-			},
-			// TODO (alberto): drop/expose this annotation at the nodePool API
-			Annotations: map[string]string{
-				"machine.cluster.x-k8s.io/exclude-node-draining": "true",
-			},
-		},
-
-		Spec: capiv1.MachineSpec{
-			ClusterName: CAPIClusterName,
-			Bootstrap: capiv1.Bootstrap{
-				// Keep current user data for later check.
-				DataSecretName: machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName,
-			},
-			InfrastructureRef: corev1.ObjectReference{
-				Kind:       gvk.Kind,
-				APIVersion: gvk.GroupVersion().String(),
-				Namespace:  machineTemplateCR.GetNamespace(),
-				Name:       machineTemplateCR.GetName(),
-			},
-			// Keep current version for later check.
-			Version: machineDeployment.Spec.Template.Spec.Version,
-		},
-	}
-
-	// Set strategy
-	machineDeployment.Spec.Strategy = &capiv1.MachineDeploymentStrategy{}
-	machineDeployment.Spec.Strategy.Type = capiv1.MachineDeploymentStrategyType(nodePool.Spec.Management.Replace.Strategy)
-	if nodePool.Spec.Management.Replace.RollingUpdate != nil {
-		machineDeployment.Spec.Strategy.RollingUpdate = &capiv1.MachineRollingUpdateDeployment{
-			MaxUnavailable: nodePool.Spec.Management.Replace.RollingUpdate.MaxUnavailable,
-			MaxSurge:       nodePool.Spec.Management.Replace.RollingUpdate.MaxSurge,
+	if hcluster.Spec.AdditionalTrustBundle != nil {
+		_, err = r.getAdditionalTrustBundle(ctx, hcluster)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
-	// Propagate version and userData Secret to the machineDeployment.
-	if userDataSecret.Name != k8sutilspointer.StringPtrDerefOr(machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName, "") {
-		log.Info("New user data Secret has been generated",
-			"current", machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName,
-			"target", userDataSecret.Name)
-
-		if targetVersion != k8sutilspointer.StringPtrDerefOr(machineDeployment.Spec.Template.Spec.Version, "") {
-			log.Info("Starting version update: Propagating new version to the MachineDeployment",
-				"releaseImage", nodePool.Spec.Release.Image, "target", targetVersion)
-		}
-
-		if targetConfigHash != nodePool.Annotations[nodePoolAnnotationCurrentConfig] {
-			log.Info("Starting config update: Propagating new config to the MachineDeployment",
-				"current", nodePool.Annotations[nodePoolAnnotationCurrentConfig], "target", targetConfigHash)
-		}
-		machineDeployment.Spec.Template.Spec.Version = &targetVersion
-		machineDeployment.Spec.Template.Spec.Bootstrap.DataSecretName = k8sutilspointer.StringPtr(userDataSecret.Name)
-
-		// We return early here during a version/config update to persist the resource with new user data Secret,
-		// so in the next reconciling loop we get a new MachineDeployment.Generation
-		// and we can do a legit MachineDeploymentComplete/MachineDeployment.Status.ObservedGeneration check.
-		// Before persisting if the NodePool is brand new we want to make sure the replica number is set so the machineDeployment controller
-		// does not panic.
-		if machineDeployment.Spec.Replicas == nil {
-			machineDeployment.Spec.Replicas = k8sutilspointer.Int32Ptr(k8sutilspointer.Int32PtrDerefOr(nodePool.Spec.NodeCount, 1))
-		}
-		return nil
+	// Validate and get releaseImage.
+	releaseImage, err := r.getReleaseImage(ctx, hcluster, nodePool.Status.Version, nodePool.Spec.Release.Image)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to look up release image metadata: %w", err)
 	}
 
-	// If the MachineDeployment is no processing we know
-	// is at the expected version (spec.version) and config (userData Secret) so we reconcile status and annotation.
-	if MachineDeploymentComplete(machineDeployment) {
-		if nodePool.Status.Version != targetVersion {
-			log.Info("Version update complete",
-				"previous", nodePool.Status.Version, "new", targetVersion)
-			nodePool.Status.Version = targetVersion
-		}
+	osStreamsEnabled := featuregate.Gate().Enabled(featuregate.OSStreams)
+	resolvedRHELStream, err := GetRHELStreamForBootImage(ctx, r.Client, nodePool, releaseImage, osStreamsEnabled)
+	if err != nil {
+		SetStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+			Type:               hyperv1.NodePoolValidPlatformImageType,
+			Status:             corev1.ConditionFalse,
+			Reason:             hyperv1.NodePoolValidationFailedReason,
+			Message:            fmt.Sprintf("Couldn't resolve RHEL stream for release image: %s", err.Error()),
+			ObservedGeneration: nodePool.Generation,
+		})
+		return ctrl.Result{}, fmt.Errorf("failed to resolve RHEL stream for boot image: %w", err)
+	}
+	if err := r.setPlatformConditions(ctx, hcluster, nodePool, controlPlaneNamespace, releaseImage, resolvedRHELStream); err != nil {
+		return ctrl.Result{}, err
+	}
 
+	if hcluster.Status.KubeConfig == nil {
+		log.Info("waiting on hostedCluster.status.kubeConfig to be set")
+		return ctrl.Result{}, nil
+	}
+
+	haproxyRawConfig, err := r.generateHAProxyRawConfig(ctx, nodePool, hcluster, releaseImage)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to generate HAProxy raw config: %w", err)
+	}
+	configGenerator, err := NewConfigGenerator(ctx, r.Client, hcluster, nodePool, releaseImage, haproxyRawConfig, controlPlaneNamespace, resolvedRHELStream)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to generate config: %w", err)
+	}
+
+	cpoCapabilities, err := r.detectCPOCapabilities(ctx, hcluster)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to detect CPO capabilities: %w", err)
+	}
+	token, err := NewToken(ctx, configGenerator, cpoCapabilities)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create token: %w", err)
+	}
+
+	// Only reconcile NTO if NodeTuning capability is enabled
+	if capabilities.IsNodeTuningCapabilityEnabled(hcluster.Spec.Capabilities) {
+		if err := r.ntoReconcile(ctx, nodePool, configGenerator, controlPlaneNamespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile NTO: %w", err)
+		}
+	}
+
+	// If reconciliation is paused we return before modifying any state
+	capi, err := newCAPI(token, infraID)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	capi.scaleFromZeroPlatform = r.ScaleFromZeroPlatform
+	if isPaused, duration := reconcilerpolicy.IsReconciliationPaused(log, nodePool.Spec.PausedUntil); isPaused {
+		if err := capi.Pause(ctx); err != nil {
+			return ctrl.Result{}, fmt.Errorf("error pausing CAPI: %w", err)
+		}
+		log.Info("Reconciliation paused", "pausedUntil", *nodePool.Spec.PausedUntil)
+		return ctrl.Result{RequeueAfter: duration}, nil
+	}
+
+	// 2. - Reconcile towards expected state of the world.
+	if err := token.Reconcile(ctx); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// non automated infrastructure should not have any machine level cluster-api components
+	if !isAutomatedMachineManagement(nodePool) {
+		targetConfigHash := token.HashWithoutVersion()
+		targetPayloadConfigHash := token.Hash()
+		nodePool.Status.Version = releaseImage.Version()
+		if nodePool.Annotations == nil {
+			nodePool.Annotations = make(map[string]string)
+		}
 		if nodePool.Annotations[nodePoolAnnotationCurrentConfig] != targetConfigHash {
 			log.Info("Config update complete",
 				"previous", nodePool.Annotations[nodePoolAnnotationCurrentConfig], "new", targetConfigHash)
 			nodePool.Annotations[nodePoolAnnotationCurrentConfig] = targetConfigHash
 		}
-		nodePool.Annotations[nodePoolAnnotationCurrentConfigVersion] = targetConfigVersionHash
+		nodePool.Annotations[nodePoolAnnotationCurrentConfigVersion] = targetPayloadConfigHash
+		return ctrl.Result{}, nil
 	}
 
-	setMachineDeploymentReplicas(nodePool, machineDeployment)
+	if err := capi.Reconcile(ctx); err != nil {
+		var notReadyErr *NotReadyError
+		if coreerrors.As(err, &notReadyErr) {
+			log.Info("Waiting to create machine template", "message", err.Error())
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		return ctrl.Result{}, err
+	}
 
-	nodePool.Status.NodeCount = machineDeployment.Status.AvailableReplicas
+	// Set scale-from-zero annotations if provider is configured and platform is supported
+	// This works for both Replace (MachineDeployment) and InPlace (MachineSet) upgrade types
+	if isAutoscalingEnabled(nodePool) && r.InstanceTypeProvider != nil && r.ScaleFromZeroPlatform == nodePool.Spec.Platform.Type {
+		if err = r.reconcileScaleFromZeroAnnotations(ctx, nodePool, capi); err != nil {
+			// Distinguish permanent errors (VM size doesn't exist in this region)
+			// from transient errors (API failure, cache load error) to avoid
+			// retrying indefinitely for non-existent VM sizes.
+			var vmNotFound *azureinstancetype.VMSizeNotFoundError
+			if coreerrors.As(err, &vmNotFound) {
+				log.Error(err, "Permanent error setting scale-from-zero annotations; verify the VM size exists in this region")
+				return ctrl.Result{}, nil
+			}
+			log.Error(err, "Failed to set scale-from-zero annotations, will retry")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *NodePoolReconciler) token(ctx context.Context, hcluster *hyperv1.HostedCluster, nodePool *hyperv1.NodePool) (*Token, error) {
+	// Validate and get releaseImage.
+	releaseImage, err := r.getReleaseImage(ctx, hcluster, nodePool.Status.Version, nodePool.Spec.Release.Image)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up release image metadata: %w", err)
+	}
+
+	haproxyRawConfig, err := r.generateHAProxyRawConfig(ctx, nodePool, hcluster, releaseImage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate HAProxy raw config: %w", err)
+	}
+	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hcluster.Namespace, hcluster.Name)
+	osStreamsEnabled := featuregate.Gate().Enabled(featuregate.OSStreams)
+	resolvedRHELStream, err := GetRHELStreamForBootImage(ctx, r.Client, nodePool, releaseImage, osStreamsEnabled)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve RHEL stream for boot image: %w", err)
+	}
+	configGenerator, err := NewConfigGenerator(ctx, r.Client, hcluster, nodePool, releaseImage, haproxyRawConfig, controlPlaneNamespace, resolvedRHELStream)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate config: %w", err)
+	}
+
+	cpoCapabilities, err := r.detectCPOCapabilities(ctx, hcluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect CPO capabilities: %w", err)
+	}
+	token, err := NewToken(ctx, configGenerator, cpoCapabilities)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create token: %w", err)
+	}
+	return token, nil
+}
+
+func isArchAndPlatformSupported(nodePool *hyperv1.NodePool) bool {
+	supported := false
+
+	switch nodePool.Spec.Platform.Type {
+	case hyperv1.AWSPlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 || nodePool.Spec.Arch == hyperv1.ArchitectureARM64 {
+			supported = true
+		}
+	case hyperv1.AzurePlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 || nodePool.Spec.Arch == hyperv1.ArchitectureARM64 {
+			supported = true
+		}
+	case hyperv1.KubevirtPlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 || nodePool.Spec.Arch == hyperv1.ArchitectureS390X {
+			supported = true
+		}
+	case hyperv1.OpenStackPlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 {
+			supported = true
+		}
+	case hyperv1.AgentPlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 || nodePool.Spec.Arch == hyperv1.ArchitecturePPC64LE || nodePool.Spec.Arch == hyperv1.ArchitectureARM64 {
+			supported = true
+		}
+	case hyperv1.PowerVSPlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitecturePPC64LE {
+			supported = true
+		}
+	case hyperv1.NonePlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 || nodePool.Spec.Arch == hyperv1.ArchitectureARM64 {
+			supported = true
+		}
+	case hyperv1.GCPPlatform:
+		if nodePool.Spec.Arch == hyperv1.ArchitectureAMD64 || nodePool.Spec.Arch == hyperv1.ArchitectureARM64 {
+			supported = true
+		}
+	}
+
+	return supported
+}
+
+func (r *NodePoolReconciler) delete(ctx context.Context, nodePool *hyperv1.NodePool, controlPlaneNamespace string) error {
+	capi := &CAPI{
+		Token: &Token{
+			CreateOrUpdateProvider: r.CreateOrUpdateProvider,
+			ConfigGenerator: &ConfigGenerator{
+				Client:                r.Client,
+				nodePool:              nodePool,
+				controlplaneNamespace: controlPlaneNamespace,
+				rolloutConfig:         &rolloutConfig{},
+			},
+		},
+	}
+	md := capi.machineDeployment()
+	ms := capi.machineSet()
+	mhc := capi.machineHealthCheck()
+	machineTemplates, err := capi.listMachineTemplates()
+	if err != nil {
+		return fmt.Errorf("failed to list MachineTemplates: %w", err)
+	}
+	for k := range machineTemplates {
+		if err := r.Delete(ctx, machineTemplates[k]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete MachineTemplate: %w", err)
+		}
+	}
+
+	if err := deleteMachineDeployment(ctx, r.Client, md); err != nil {
+		return fmt.Errorf("failed to delete MachineDeployment: %w", err)
+	}
+
+	if err := deleteMachineHealthCheck(ctx, r.Client, mhc); err != nil {
+		return fmt.Errorf("failed to delete MachineHealthCheck: %w", err)
+	}
+
+	if err := deleteMachineSet(ctx, r.Client, ms); err != nil {
+		return fmt.Errorf("failed to delete MachineSet: %w", err)
+	}
+
+	// Delete any ConfigMap belonging to this NodePool i.e. TunedConfig ConfigMaps.
+	// NOTE: HCCO's reconcileKubeletConfig infers NodePool liveness from the
+	// presence of CMs in this namespace. This cleanup must complete before
+	// the finalizer is removed.
+	err = r.DeleteAllOf(ctx, &corev1.ConfigMap{},
+		client.InNamespace(controlPlaneNamespace),
+		client.MatchingLabels{nodePoolAnnotation: nodePool.GetName()},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete ConfigMaps with nodePool label: %w", err)
+	}
+
+	// Ensure all machines in NodePool are deleted
+	if err = r.ensureMachineDeletion(ctx, nodePool); err != nil {
+		return err
+	}
+
+	// Delete all secrets related to the NodePool
+	if err = r.deleteNodePoolSecrets(ctx, nodePool); err != nil {
+		return fmt.Errorf("failed to delete NodePool secrets: %w", err)
+	}
+
+	err = r.deleteKubeVirtCache(ctx, nodePool, controlPlaneNamespace)
+	if err != nil {
+		return err
+	}
+
+	r.KubevirtInfraClients.Delete(string(nodePool.GetUID()))
+
 	return nil
 }
 
-func (r *NodePoolReconciler) reconcileMachineHealthCheck(mhc *capiv1.MachineHealthCheck,
-	nodePool *hyperv1.NodePool,
-	CAPIClusterName string) error {
-	// Opinionated spec based on
-	// https://github.com/openshift/managed-cluster-config/blob/14d4255ec75dc263ffd3d897dfccc725cb2b7072/deploy/osd-machine-api/011-machine-api.srep-worker-healthcheck.MachineHealthCheck.yaml
-	// TODO (alberto): possibly expose this config at the nodePool API.
-	maxUnhealthy := intstr.FromInt(2)
-	resourcesName := generateName(CAPIClusterName, nodePool.Spec.ClusterName, nodePool.GetName())
-	mhc.Spec = capiv1.MachineHealthCheckSpec{
-		ClusterName: CAPIClusterName,
-		Selector: metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				resourcesName: resourcesName,
-			},
-		},
-		UnhealthyConditions: []capiv1.UnhealthyCondition{
-			{
-				Type:   corev1.NodeReady,
-				Status: corev1.ConditionFalse,
-				Timeout: metav1.Duration{
-					Duration: 8 * time.Minute,
-				},
-			},
-			{
-				Type:   corev1.NodeReady,
-				Status: corev1.ConditionUnknown,
-				Timeout: metav1.Duration{
-					Duration: 8 * time.Minute,
-				},
-			},
-		},
-		MaxUnhealthy: &maxUnhealthy,
-		NodeStartupTimeout: &metav1.Duration{
-			Duration: 10 * time.Minute,
-		},
+func (r *NodePoolReconciler) deleteKubeVirtCache(ctx context.Context, nodePool *hyperv1.NodePool, controlPlaneNamespace string) error {
+	if nodePool.Status.Platform != nil {
+		if nodePool.Status.Platform.KubeVirt != nil {
+			if cacheName := nodePool.Status.Platform.KubeVirt.CacheName; len(cacheName) > 0 {
+				uid := string(nodePool.GetUID())
+				cl, err := r.KubevirtInfraClients.DiscoverKubevirtClusterClient(ctx, r.Client, uid, nodePool.Status.Platform.KubeVirt.Credentials, controlPlaneNamespace, nodePool.GetNamespace())
+				if err != nil {
+					return fmt.Errorf("failed to get KubeVirt external infra-cluster:  %w", err)
+				}
+
+				ns := controlPlaneNamespace
+				if nodePool.Status.Platform.KubeVirt.Credentials != nil && len(nodePool.Status.Platform.KubeVirt.Credentials.InfraNamespace) > 0 {
+					ns = nodePool.Status.Platform.KubeVirt.Credentials.InfraNamespace
+				}
+
+				err = kubevirt.DeleteCache(ctx, cl.GetInfraClient(), cacheName, ns)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
 
-// setMachineDeploymentReplicas sets wanted replicas:
-// If autoscaling is enabled we reconcile min/max annotations and leave replicas untouched.
-func setMachineDeploymentReplicas(nodePool *hyperv1.NodePool, machineDeployment *capiv1.MachineDeployment) {
-	if machineDeployment.Annotations == nil {
-		machineDeployment.Annotations = make(map[string]string)
+// deleteNodePoolSecrets deletes any secret belonging to this NodePool (ex. token Secret and userdata Secret)
+func (r *NodePoolReconciler) deleteNodePoolSecrets(ctx context.Context, nodePool *hyperv1.NodePool) error {
+	secrets, err := r.listSecrets(ctx, nodePool)
+	if err != nil {
+		return fmt.Errorf("failed to list secrets: %w", err)
 	}
-
-	if isAutoscalingEnabled(nodePool) {
-		if machineDeployment.CreationTimestamp.IsZero() {
-			// if autoscaling is enabled and the machineDeployment does not exist yet and so it has nil/0 replicas
-			// we start with 1 replica as the autoscaler does not support scaling from zero yet.
-			machineDeployment.Spec.Replicas = k8sutilspointer.Int32Ptr(int32(1))
+	for k := range secrets {
+		if err := r.Delete(ctx, &secrets[k]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete secret: %w", err)
 		}
-		machineDeployment.Annotations[autoscalerMaxAnnotation] = strconv.Itoa(int(nodePool.Spec.AutoScaling.Max))
-		machineDeployment.Annotations[autoscalerMinAnnotation] = strconv.Itoa(int(nodePool.Spec.AutoScaling.Min))
 	}
-
-	// If autoscaling is NOT enabled we reset min/max annotations and reconcile replicas.
-	if !isAutoscalingEnabled(nodePool) {
-		machineDeployment.Annotations[autoscalerMaxAnnotation] = "0"
-		machineDeployment.Annotations[autoscalerMinAnnotation] = "0"
-		machineDeployment.Spec.Replicas = k8sutilspointer.Int32Ptr(k8sutilspointer.Int32PtrDerefOr(nodePool.Spec.NodeCount, 0))
-	}
-}
-
-func getAMI(nodePool *hyperv1.NodePool, region string, releaseImage *releaseinfo.ReleaseImage) (string, error) {
-	if nodePool.Spec.Platform.AWS.AMI != "" {
-		return nodePool.Spec.Platform.AWS.AMI, nil
-	}
-
-	return defaultNodePoolAMI(region, releaseImage)
-}
-
-func ignConfig(encodedCACert, encodedToken, endpoint string) ignitionapi.Config {
-	return ignitionapi.Config{
-		Ignition: ignitionapi.Ignition{
-			Version: "3.1.0",
-			Security: ignitionapi.Security{
-				TLS: ignitionapi.TLS{
-					CertificateAuthorities: []ignitionapi.Resource{
-						{
-							Source: k8sutilspointer.StringPtr(fmt.Sprintf("data:text/plain;base64,%s", encodedCACert)),
-						},
-					},
-				},
-			},
-			Config: ignitionapi.IgnitionConfig{
-				Merge: []ignitionapi.Resource{
-					{
-						Source: k8sutilspointer.StringPtr(fmt.Sprintf("https://%s/ignition", endpoint)),
-						HTTPHeaders: []ignitionapi.HTTPHeader{
-							{
-								Name:  "Authorization",
-								Value: k8sutilspointer.StringPtr(fmt.Sprintf("Bearer %s", encodedToken)),
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func (r *NodePoolReconciler) getConfig(ctx context.Context, nodePool *hyperv1.NodePool, expectedCoreConfigResources int, controlPlaneResource string) (string, error) {
-	var configs []corev1.ConfigMap
-	allConfigPlainText := ""
-	var errors []error
-
-	coreConfigMapList := &corev1.ConfigMapList{}
-	if err := r.List(ctx, coreConfigMapList, client.MatchingLabels{
-		nodePoolCoreIgnitionConfigLabel: "true",
-	}, client.InNamespace(controlPlaneResource)); err != nil {
-		errors = append(errors, err)
-	}
-
-	if len(coreConfigMapList.Items) != expectedCoreConfigResources {
-		errors = append(errors, fmt.Errorf("core ingition config has not been created yet"))
-	}
-
-	configs = coreConfigMapList.Items
-	for _, config := range nodePool.Spec.Config {
-		configConfigMap := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      config.Name,
-				Namespace: nodePool.Namespace,
-			},
-		}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(configConfigMap), configConfigMap); err != nil {
-			errors = append(errors, err)
-			continue
-		}
-		configs = append(configs, *configConfigMap)
-	}
-
-	for _, config := range configs {
-		manifest := config.Data[TokenSecretConfigKey]
-		if err := validateConfigManifest([]byte(manifest)); err != nil {
-			errors = append(errors, fmt.Errorf("configmap %q failed validation: %w", config.Name, err))
-			continue
-		}
-
-		allConfigPlainText = allConfigPlainText + "\n---\n" + manifest
-	}
-
-	return allConfigPlainText, utilerrors.NewAggregate(errors)
+	return nil
 }
 
 // validateManagement does additional backend validation. API validation/default should
 // prevent this from ever fail.
 func validateManagement(nodePool *hyperv1.NodePool) error {
+	// TODO actually validate the inplace upgrade type
+	if nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeInPlace {
+		return nil
+	}
+
 	// Only upgradeType "Replace" is supported atm.
 	if nodePool.Spec.Management.UpgradeType != hyperv1.UpgradeTypeReplace ||
 		nodePool.Spec.Management.Replace == nil {
@@ -945,56 +723,79 @@ func validateManagement(nodePool *hyperv1.NodePool) error {
 
 	return nil
 }
-func validateConfigManifest(manifest []byte) error {
-	scheme := runtime.NewScheme()
-	mcfgv1.Install(scheme)
-	v1alpha1.Install(scheme)
 
-	YamlSerializer := serializer.NewSerializerWithOptions(
-		serializer.DefaultMetaFactory, scheme, scheme,
-		serializer.SerializerOptions{Yaml: true, Pretty: true, Strict: true},
-	)
-
-	cr, _, err := YamlSerializer.Decode(manifest, nil, nil)
+func (r *NodePoolReconciler) getReleaseImage(ctx context.Context, hostedCluster *hyperv1.HostedCluster, currentVersion string, releaseImage string) (*releaseinfo.ReleaseImage, error) {
+	pullSecretBytes, err := r.getPullSecretBytes(ctx, hostedCluster)
 	if err != nil {
-		return fmt.Errorf("error decoding config: %w", err)
-	}
-
-	switch obj := cr.(type) {
-	case *mcfgv1.MachineConfig:
-	case *v1alpha1.ImageContentSourcePolicy:
-	//	TODO (alberto): enable this kinds when they are supported in mcs bootstrap mode
-	// since our mcsIgnitionProvider implementation uses bootstrap mode to render the ignition payload out of an input.
-	// https://github.com/openshift/machine-config-operator/pull/2547
-	//case *mcfgv1.KubeletConfig:
-	//case *mcfgv1.ContainerRuntimeConfig:
-	default:
-		return fmt.Errorf("unsupported config type: %T", obj)
-	}
-
-	return nil
-}
-
-func (r *NodePoolReconciler) getReleaseImage(ctx context.Context, hostedCluster *hyperv1.HostedCluster, releaseImage string) (*releaseinfo.ReleaseImage, error) {
-	pullSecret := &corev1.Secret{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: hostedCluster.Namespace, Name: hostedCluster.Spec.PullSecret.Name}, pullSecret); err != nil {
-		return nil, fmt.Errorf("cannot get pull secret %s/%s: %w", hostedCluster.Namespace, hostedCluster.Spec.PullSecret.Name, err)
-	}
-	if _, hasKey := pullSecret.Data[corev1.DockerConfigJsonKey]; !hasKey {
-		return nil, fmt.Errorf("pull secret %s/%s missing %q key", pullSecret.Namespace, pullSecret.Name, corev1.DockerConfigJsonKey)
+		return nil, err
 	}
 	ReleaseImage, err := func(ctx context.Context) (*releaseinfo.ReleaseImage, error) {
-		ctx, span := r.tracer.Start(ctx, "image-lookup")
-		defer span.End()
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, 1*time.Minute)
 		defer lookupCancel()
-		img, err := r.ReleaseProvider.Lookup(lookupCtx, releaseImage, pullSecret.Data[corev1.DockerConfigJsonKey])
+		img, err := r.ReleaseProvider.Lookup(lookupCtx, releaseImage, pullSecretBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to look up release image metadata: %w", err)
 		}
 		return img, nil
 	}(ctx)
-	return ReleaseImage, err
+	if err != nil {
+		return nil, err
+	}
+
+	if _, exists := hostedCluster.Annotations[hyperv1.SkipReleaseImageValidation]; exists {
+		return ReleaseImage, nil
+	}
+
+	wantedVersion, err := semver.Parse(ReleaseImage.Version())
+	if err != nil {
+		return nil, err
+	}
+
+	var currentVersionParsed *semver.Version
+	if currentVersion != "" {
+		parsed, err := semver.Parse(currentVersion)
+		if err != nil {
+			return nil, err
+		}
+		currentVersionParsed = &parsed
+	}
+
+	minSupportedVersion := supportedversion.GetMinSupportedVersion(hostedCluster)
+
+	hostedClusterVersion, err := r.getHostedClusterVersion(ctx, hostedCluster, pullSecretBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return ReleaseImage, supportedversion.IsValidReleaseVersion(&wantedVersion, currentVersionParsed, hostedClusterVersion, &minSupportedVersion, hostedCluster.Spec.Networking.NetworkType, hostedCluster.Spec.Platform.Type)
+}
+
+func (r *NodePoolReconciler) getHostedClusterVersion(ctx context.Context, hostedCluster *hyperv1.HostedCluster, pullSecretBytes []byte) (*semver.Version, error) {
+	if hostedCluster.Status.Version != nil && len(hostedCluster.Status.Version.History) > 0 {
+		for _, version := range hostedCluster.Status.Version.History {
+			// find first completed version
+			if version.CompletionTime == nil {
+				continue
+			}
+
+			hostedClusterVersion, err := semver.Parse(version.Version)
+			if err != nil {
+				return nil, err
+			}
+			return &hostedClusterVersion, nil
+		}
+	}
+
+	// use Spec.Release.Image if there is no completed version yet. This could happen at the initial creation of the cluster.
+	releaseInfo, err := r.ReleaseProvider.Lookup(ctx, hostedCluster.Spec.Release.Image, pullSecretBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lookup release image: %w", err)
+	}
+	hostedClusterVersion, err := semver.Parse(releaseInfo.Version())
+	if err != nil {
+		return nil, err
+	}
+	return &hostedClusterVersion, nil
 }
 
 func isUpdatingVersion(nodePool *hyperv1.NodePool, targetVersion string) bool {
@@ -1005,39 +806,32 @@ func isUpdatingConfig(nodePool *hyperv1.NodePool, targetConfigHash string) bool 
 	return targetConfigHash != nodePool.GetAnnotations()[nodePoolAnnotationCurrentConfig]
 }
 
+func isUpdatingMachineTemplate(nodePool *hyperv1.NodePool, targetMachineTemplate string) bool {
+	return targetMachineTemplate != nodePool.GetAnnotations()[nodePoolAnnotationPlatformMachineTemplate]
+}
+
 func isAutoscalingEnabled(nodePool *hyperv1.NodePool) bool {
 	return nodePool.Spec.AutoScaling != nil
 }
 
-func validateAutoscaling(nodePool *hyperv1.NodePool) error {
-	if nodePool.Spec.NodeCount != nil && nodePool.Spec.AutoScaling != nil {
-		return fmt.Errorf("only one of nodePool.Spec.NodeCount or nodePool.Spec.AutoScaling can be set")
+// defaultNodePoolAMI resolves the default AWS AMI for a NodePool from release image stream metadata.
+func defaultNodePoolAMI(region string, specifiedArch string, rhelStream string, releaseImage *releaseinfo.ReleaseImage) (string, error) {
+	if releaseImage == nil {
+		return "", fmt.Errorf("release image is nil")
 	}
-
-	if nodePool.Spec.AutoScaling != nil {
-		max := nodePool.Spec.AutoScaling.Max
-		min := nodePool.Spec.AutoScaling.Min
-
-		if max < min {
-			return fmt.Errorf("max must be equal or greater than min. Max: %v, Min: %v", max, min)
-		}
-
-		if max == 0 || min == 0 {
-			return fmt.Errorf("max and min must be not zero. Max: %v, Min: %v", max, min)
-		}
+	streamMeta, err := releaseImage.StreamForName(rhelStream)
+	if err != nil {
+		return "", fmt.Errorf("couldn't resolve stream metadata: %w", err)
 	}
-
-	return nil
-}
-
-func defaultNodePoolAMI(region string, releaseImage *releaseinfo.ReleaseImage) (string, error) {
-	// TODO: The architecture should be specified from the API
-	arch, foundArch := releaseImage.StreamMetadata.Architectures["x86_64"]
+	arch, foundArch := streamMeta.Architectures[hyperv1.ArchAliases[specifiedArch]]
 	if !foundArch {
-		return "", fmt.Errorf("couldn't find OS metadata for architecture %q", "x64_64")
+		return "", fmt.Errorf("couldn't find OS metadata for architecture %q", specifiedArch)
 	}
 
-	regionData, hasRegionData := arch.Images.AWS.Regions[region]
+	if arch.Images.Aws == nil {
+		return "", fmt.Errorf("release image metadata has no AWS images")
+	}
+	regionData, hasRegionData := arch.Images.Aws.Regions[region]
 	if !hasRegionData {
 		return "", fmt.Errorf("couldn't find AWS image for region %q", region)
 	}
@@ -1047,14 +841,61 @@ func defaultNodePoolAMI(region string, releaseImage *releaseinfo.ReleaseImage) (
 	return regionData.Image, nil
 }
 
+// defaultNodePoolGCPImage returns the default GCP image for a given architecture from release metadata.
+func defaultNodePoolGCPImage(specifiedArch string, releaseImage *releaseinfo.ReleaseImage, rhelStream string) (string, error) {
+	if releaseImage == nil {
+		return "", fmt.Errorf("release image is nil, cannot determine GCP image")
+	}
+	streamMeta, err := releaseImage.StreamForName(rhelStream)
+	if err != nil {
+		return "", fmt.Errorf("couldn't resolve stream metadata: %w", err)
+	}
+
+	arch, foundArch := streamMeta.Architectures[hyperv1.ArchAliases[specifiedArch]]
+	if !foundArch {
+		return "", fmt.Errorf("couldn't find OS metadata for architecture %q", specifiedArch)
+	}
+
+	if arch.Images.Gcp == nil || len(arch.Images.Gcp.Project) == 0 || len(arch.Images.Gcp.Name) == 0 {
+		return "", fmt.Errorf("release image metadata has no GCP image for architecture %q", specifiedArch)
+	}
+	return fmt.Sprintf("projects/%s/global/images/%s", arch.Images.Gcp.Project, arch.Images.Gcp.Name), nil
+}
+
 // MachineDeploymentComplete considers a MachineDeployment to be complete once all of its desired replicas
 // are updated and available, and no old machines are running.
-func MachineDeploymentComplete(deployment *capiv1.MachineDeployment) bool {
+// It requires the list of MachineSets owned by the MachineDeployment to verify that only a single
+// active MachineSet remains. This guards against a race in CAPI where ObservedGeneration and status
+// counters (UpToDateReplicas, AvailableReplicas) are set before downstream controllers (Machine,
+// MachineSet) have reconciled the template change, causing the counters to be stale.
+// See https://github.com/kubernetes-sigs/cluster-api/issues/13738.
+func MachineDeploymentComplete(deployment *capiv1.MachineDeployment, machineSets []capiv1.MachineSet) bool {
+	desired := ptr.Deref(deployment.Spec.Replicas, 0)
 	newStatus := &deployment.Status
-	return newStatus.UpdatedReplicas == *(deployment.Spec.Replicas) &&
-		newStatus.Replicas == *(deployment.Spec.Replicas) &&
-		newStatus.AvailableReplicas == *(deployment.Spec.Replicas) &&
-		newStatus.ObservedGeneration >= deployment.Generation
+
+	// differentiate the nil and 0 cases
+	if newStatus.Replicas == nil || newStatus.AvailableReplicas == nil || newStatus.UpToDateReplicas == nil {
+		return false
+	}
+
+	if *newStatus.AvailableReplicas != desired ||
+		*newStatus.Replicas != desired ||
+		*newStatus.UpToDateReplicas != desired ||
+		newStatus.ObservedGeneration < deployment.Generation {
+		return false
+	}
+
+	// Guard against stale counters: verify that no old MachineSet still has replicas.
+	// If old MachineSets still have replicas, the rollout is not complete regardless
+	// of what the MachineDeployment counters report.
+	currentRevision := deployment.Annotations[capiv1.RevisionAnnotation]
+	for i := range machineSets {
+		if machineSets[i].Annotations[capiv1.RevisionAnnotation] != currentRevision && ptr.Deref(machineSets[i].Status.Replicas, 0) > 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 // GetHostedClusterByName finds and return a HostedCluster object using the specified params.
@@ -1072,7 +913,7 @@ func GetHostedClusterByName(ctx context.Context, c client.Client, namespace, nam
 	return hcluster, nil
 }
 
-func (r *NodePoolReconciler) enqueueNodePoolsForHostedCluster(obj client.Object) []reconcile.Request {
+func (r *NodePoolReconciler) enqueueNodePoolsForHostedCluster(ctx context.Context, obj client.Object) []reconcile.Request {
 	var result []reconcile.Request
 
 	hc, ok := obj.(*hyperv1.HostedCluster)
@@ -1081,8 +922,8 @@ func (r *NodePoolReconciler) enqueueNodePoolsForHostedCluster(obj client.Object)
 	}
 
 	nodePoolList := &hyperv1.NodePoolList{}
-	if err := r.List(context.Background(), nodePoolList, client.InNamespace(hc.Namespace)); err != nil {
-		ctrl.LoggerFrom(context.Background()).Error(err, "Failed to list nodePools")
+	if err := r.List(ctx, nodePoolList, client.InNamespace(hc.Namespace)); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "Failed to list nodePools")
 		return result
 	}
 
@@ -1098,7 +939,7 @@ func (r *NodePoolReconciler) enqueueNodePoolsForHostedCluster(obj client.Object)
 	return result
 }
 
-func (r *NodePoolReconciler) enqueueNodePoolsForConfig(obj client.Object) []reconcile.Request {
+func (r *NodePoolReconciler) enqueueNodePoolsForConfig(ctx context.Context, obj client.Object) []reconcile.Request {
 	var result []reconcile.Request
 
 	cm, ok := obj.(*corev1.ConfigMap)
@@ -1108,7 +949,7 @@ func (r *NodePoolReconciler) enqueueNodePoolsForConfig(obj client.Object) []reco
 
 	// Get all NodePools in the ConfigMap Namespace.
 	nodePoolList := &hyperv1.NodePoolList{}
-	if err := r.List(context.Background(), nodePoolList, client.InNamespace(cm.Namespace)); err != nil {
+	if err := r.List(ctx, nodePoolList, client.InNamespace(cm.Namespace)); err != nil {
 		return result
 	}
 
@@ -1122,22 +963,112 @@ func (r *NodePoolReconciler) enqueueNodePoolsForConfig(obj client.Object) []reco
 		return result
 	}
 
+	// If the ConfigMap is generated by the NodePool controller and contains Tuned manifests
+	// return the ConfigMaps parent NodePool.
+	if isNodePoolGeneratedTuningConfigMap(cm) {
+		return enqueueParentNodePool(ctx, obj)
+	}
+
+	// Check if the ConfigMap is generated by an operator in the control plane namespace
+	// corresponding to this nodepool.
+	_, isNodeTuningGeneratedConfigLabel := obj.GetLabels()[nodeTuningGeneratedConfigLabel]
+	_, isNodeTuningGeneratedPerformanceProfileStatusLabel := obj.GetLabels()[NodeTuningGeneratedPerformanceProfileStatusLabel]
+	if isNodeTuningGeneratedConfigLabel || isNodeTuningGeneratedPerformanceProfileStatusLabel {
+		nodePoolName := obj.GetLabels()[hyperv1.NodePoolLabel]
+		nodePoolNamespacedName, err := r.getNodePoolNamespacedName(nodePoolName, obj.GetNamespace())
+		if err != nil {
+			return result
+		}
+		obj.SetAnnotations(map[string]string{
+			nodePoolAnnotation: nodePoolNamespacedName.String(),
+		})
+		return enqueueParentNodePool(ctx, obj)
+	}
+
 	// Otherwise reconcile NodePools which are referencing the given ConfigMap.
 	for key := range nodePoolList.Items {
+		reconcileNodePool := false
 		for _, v := range nodePoolList.Items[key].Spec.Config {
 			if v.Name == cm.Name {
-				result = append(result,
-					reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&nodePoolList.Items[key])},
-				)
+				reconcileNodePool = true
 				break
 			}
 		}
+
+		// Check TuningConfig as well, unless ConfigMap was already found in .Spec.Config.
+		if !reconcileNodePool {
+			for _, v := range nodePoolList.Items[key].Spec.TuningConfig {
+				if v.Name == cm.Name {
+					reconcileNodePool = true
+					break
+				}
+			}
+		}
+		if reconcileNodePool {
+			result = append(result,
+				reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&nodePoolList.Items[key])},
+			)
+		}
+
 	}
 
 	return result
 }
 
-func enqueueParentNodePool(obj client.Object) []reconcile.Request {
+func (r *NodePoolReconciler) enqueueNodePoolsForCloudConfig(ctx context.Context, obj client.Object) []reconcile.Request {
+	hcpList := &hyperv1.HostedControlPlaneList{}
+	if err := r.List(ctx, hcpList, client.InNamespace(obj.GetNamespace())); err != nil || len(hcpList.Items) == 0 {
+		return nil
+	}
+	hcName, ok := hcpList.Items[0].Annotations[k8sutil.HostedClusterAnnotation]
+	if !ok {
+		return nil
+	}
+	hc := supportutil.ParseNamespacedName(hcName)
+
+	nodePoolList := &hyperv1.NodePoolList{}
+	if err := r.List(ctx, nodePoolList, client.InNamespace(hc.Namespace)); err != nil {
+		return nil
+	}
+
+	var result []reconcile.Request
+	for i := range nodePoolList.Items {
+		if nodePoolList.Items[i].Spec.ClusterName == hc.Name {
+			result = append(result, reconcile.Request{
+				NamespacedName: client.ObjectKeyFromObject(&nodePoolList.Items[i]),
+			})
+		}
+	}
+	return result
+}
+
+// getNodePoolNamespace returns the namespaced name of a NodePool, given the NodePools name
+// and the control plane namespace name for the hosted cluster that this NodePool is a part of.
+func (r *NodePoolReconciler) getNodePoolNamespacedName(nodePoolName string, controlPlaneNamespace string) (types.NamespacedName, error) {
+	hcpList := &hyperv1.HostedControlPlaneList{}
+	if err := r.List(context.Background(), hcpList, &client.ListOptions{
+		Namespace: controlPlaneNamespace,
+	}); err != nil || len(hcpList.Items) < 1 {
+		return types.NamespacedName{Name: nodePoolName}, err
+	}
+	hostedCluster, ok := hcpList.Items[0].Annotations[k8sutil.HostedClusterAnnotation]
+	if !ok {
+		return types.NamespacedName{Name: nodePoolName}, fmt.Errorf("failed to get Hosted Cluster name for HostedControlPlane %s", hcpList.Items[0].Name)
+	}
+	nodePoolNamespace := supportutil.ParseNamespacedName(hostedCluster).Namespace
+
+	return types.NamespacedName{Name: nodePoolName, Namespace: nodePoolNamespace}, nil
+}
+
+func isNodePoolGeneratedTuningConfigMap(cm *corev1.ConfigMap) bool {
+	if _, ok := cm.GetLabels()[tunedConfigMapLabel]; ok {
+		return true
+	}
+	_, ok := cm.GetLabels()[PerformanceProfileConfigMapLabel]
+	return ok
+}
+
+func enqueueParentNodePool(ctx context.Context, obj client.Object) []reconcile.Request {
 	var nodePoolName string
 	if obj.GetAnnotations() != nil {
 		nodePoolName = obj.GetAnnotations()[nodePoolAnnotation]
@@ -1146,13 +1077,13 @@ func enqueueParentNodePool(obj client.Object) []reconcile.Request {
 		return []reconcile.Request{}
 	}
 	return []reconcile.Request{
-		{NamespacedName: hyperutil.ParseNamespacedName(nodePoolName)},
+		{NamespacedName: supportutil.ParseNamespacedName(nodePoolName)},
 	}
 }
 
-func (r *NodePoolReconciler) listSecrets(nodePool *hyperv1.NodePool) ([]corev1.Secret, error) {
+func (r *NodePoolReconciler) listSecrets(ctx context.Context, nodePool *hyperv1.NodePool) ([]corev1.Secret, error) {
 	secretList := &corev1.SecretList{}
-	if err := r.List(context.Background(), secretList); err != nil {
+	if err := r.List(ctx, secretList); err != nil {
 		return nil, fmt.Errorf("failed to list secrets: %w", err)
 	}
 	filtered := []corev1.Secret{}
@@ -1167,111 +1098,358 @@ func (r *NodePoolReconciler) listSecrets(nodePool *hyperv1.NodePool) ([]corev1.S
 	return filtered, nil
 }
 
-func (r *NodePoolReconciler) listAWSMachineTemplates(nodePool *hyperv1.NodePool) ([]capiaws.AWSMachineTemplate, error) {
-	awsMachineTemplateList := &capiaws.AWSMachineTemplateList{}
-	if err := r.List(context.Background(), awsMachineTemplateList); err != nil {
-		return nil, fmt.Errorf("failed to list AWSMachineTemplates: %w", err)
+func isAutomatedMachineManagement(nodePool *hyperv1.NodePool) bool {
+	return !(isIBMUPI(nodePool) || isPlatformNone(nodePool))
+}
+
+func isIBMUPI(nodePool *hyperv1.NodePool) bool {
+	return nodePool.Spec.Platform.IBMCloud != nil && nodePool.Spec.Platform.IBMCloud.ProviderType == configv1.IBMCloudProviderTypeUPI
+}
+
+func isPlatformNone(nodePool *hyperv1.NodePool) bool {
+	return nodePool.Spec.Platform.Type == hyperv1.NonePlatform
+}
+
+func validateInfraID(infraID string) error {
+	if infraID == "" {
+		return fmt.Errorf("infraID can't be empty")
 	}
-	filtered := []capiaws.AWSMachineTemplate{}
-	for i, AWSMachineTemplate := range awsMachineTemplateList.Items {
-		if AWSMachineTemplate.GetAnnotations() != nil {
-			if annotation, ok := AWSMachineTemplate.GetAnnotations()[nodePoolAnnotation]; ok &&
-				annotation == client.ObjectKeyFromObject(nodePool).String() {
-				filtered = append(filtered, awsMachineTemplateList.Items[i])
+	return nil
+}
+
+func (r *NodePoolReconciler) detectCPOCapabilities(ctx context.Context, hostedCluster *hyperv1.HostedCluster) (*CPOCapabilities, error) {
+	pullSecretBytes, err := r.getPullSecretBytes(ctx, hostedCluster)
+	if err != nil {
+		return nil, err
+	}
+	controlPlaneOperatorImage, err := supportutil.GetControlPlaneOperatorImage(ctx, hostedCluster, r.ReleaseProvider, r.HypershiftOperatorImage, pullSecretBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get controlPlaneOperatorImage: %w", err)
+	}
+
+	controlPlaneOperatorImageMetadata, err := r.ImageMetadataProvider.ImageMetadata(ctx, controlPlaneOperatorImage, pullSecretBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up image metadata for %s: %w", controlPlaneOperatorImage, err)
+	}
+
+	imageLabels := supportutil.ImageLabels(controlPlaneOperatorImageMetadata)
+	result := &CPOCapabilities{}
+	_, result.DecompressAndDecodeConfig = imageLabels[controlPlaneOperatorManagesDecompressAndDecodeConfig]
+	_, result.CreateDefaultAWSSecurityGroup = imageLabels[controlPlaneOperatorCreatesDefaultAWSSecurityGroup]
+
+	return result, nil
+}
+
+// getPullSecretBytes retrieves the pull secret bytes from the hosted cluster
+func (r *NodePoolReconciler) getPullSecretBytes(ctx context.Context, hostedCluster *hyperv1.HostedCluster) ([]byte, error) {
+	pullSecret := &corev1.Secret{}
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: hostedCluster.Namespace, Name: hostedCluster.Spec.PullSecret.Name}, pullSecret); err != nil {
+		return nil, fmt.Errorf("cannot get pull secret %s/%s: %w", hostedCluster.Namespace, hostedCluster.Spec.PullSecret.Name, err)
+	}
+	if _, hasKey := pullSecret.Data[corev1.DockerConfigJsonKey]; !hasKey {
+		return nil, fmt.Errorf("pull secret %s/%s missing %q key", pullSecret.Namespace, pullSecret.Name, corev1.DockerConfigJsonKey)
+	}
+	return pullSecret.Data[corev1.DockerConfigJsonKey], nil
+}
+
+// getPullSecretName retrieves the name of the pull secret in the hosted cluster spec
+func (r *NodePoolReconciler) getPullSecretName(ctx context.Context, hostedCluster *hyperv1.HostedCluster) (string, error) {
+	return getPullSecretName(ctx, r.Client, hostedCluster)
+}
+
+func getPullSecretName(ctx context.Context, crclient client.Client, hostedCluster *hyperv1.HostedCluster) (string, error) {
+	pullSecret := &corev1.Secret{}
+	if err := crclient.Get(ctx, client.ObjectKey{Namespace: hostedCluster.Namespace, Name: hostedCluster.Spec.PullSecret.Name}, pullSecret); err != nil {
+		return "", fmt.Errorf("cannot get pull secret %s/%s: %w", hostedCluster.Namespace, hostedCluster.Spec.PullSecret.Name, err)
+	}
+	if _, hasKey := pullSecret.Data[corev1.DockerConfigJsonKey]; !hasKey {
+		return "", fmt.Errorf("pull secret %s/%s missing %q key when retrieving pull secret name", pullSecret.Namespace, pullSecret.Name, corev1.DockerConfigJsonKey)
+	}
+	return pullSecret.Name, nil
+}
+
+func (r *NodePoolReconciler) getAdditionalTrustBundle(ctx context.Context, hostedCluster *hyperv1.HostedCluster) (*corev1.ConfigMap, error) {
+	additionalTrustBundle := &corev1.ConfigMap{}
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: hostedCluster.Namespace, Name: hostedCluster.Spec.AdditionalTrustBundle.Name}, additionalTrustBundle); err != nil {
+		return additionalTrustBundle, fmt.Errorf("cannot get additionalTrustBundle %s/%s: %w", hostedCluster.Namespace, hostedCluster.Spec.AdditionalTrustBundle.Name, err)
+	}
+	if _, hasKey := additionalTrustBundle.Data["ca-bundle.crt"]; !hasKey {
+		return additionalTrustBundle, fmt.Errorf(" additionalTrustBundle %s/%s missing %q key", additionalTrustBundle.Namespace, additionalTrustBundle.Name, "ca-bundle.crt")
+	}
+	return additionalTrustBundle, nil
+}
+
+// resolveHAProxyImage determines which HAProxy image to use based on priority:
+// 1. NodePool annotation (highest priority)
+// 2. Shared ingress image (when cluster uses shared ingress for public endpoints)
+// 3. Release payload (default)
+//
+// When useCanonicalImages is true and the image comes from the release payload,
+// canonical (pre-override) component images are used. The HAProxy image is
+// embedded in a static pod manifest that runs on data plane nodes, where CRI-O
+// handles mirroring natively via IDMS/ICSP — so the canonical (non-overridden)
+// image reference must be used.
+func resolveHAProxyImage(nodePool *hyperv1.NodePool, hcluster *hyperv1.HostedCluster, releaseImage *releaseinfo.ReleaseImage, useCanonicalImages bool) (string, error) {
+	if annotationImage := strings.TrimSpace(nodePool.Annotations[hyperv1.NodePoolHAProxyImageAnnotation]); annotationImage != "" {
+		return annotationImage, nil
+	}
+
+	if netutil.UseSharedIngressHC(hcluster) {
+		return images.GetSharedIngressHAProxyImage(), nil
+	}
+
+	componentImages := releaseImage.ComponentImages()
+	if useCanonicalImages {
+		componentImages = releaseImage.CanonicalComponentImages()
+	}
+
+	haProxyImage, ok := componentImages[haproxy.HAProxyRouterImageName]
+	if !ok {
+		return "", fmt.Errorf("release image doesn't have a %s image", haproxy.HAProxyRouterImageName)
+	}
+
+	return haProxyImage, nil
+}
+
+func (r *NodePoolReconciler) generateHAProxyRawConfig(ctx context.Context, nodePool *hyperv1.NodePool, hcluster *hyperv1.HostedCluster, releaseImage *releaseinfo.ReleaseImage) (string, error) {
+	useCanonicalImages := nodePool.Annotations[nodePoolAnnotationCanonicalDataPlaneImages] == "true"
+	if !useCanonicalImages {
+		isNewOrUpgrading := nodePool.Status.Version == "" || nodePool.Status.Version != releaseImage.Version()
+		if isNewOrUpgrading {
+			useCanonicalImages = true
+			if nodePool.Annotations == nil {
+				nodePool.Annotations = make(map[string]string)
 			}
-		}
-	}
-	return filtered, nil
-}
-
-func compress(content []byte) ([]byte, error) {
-	if len(content) == 0 {
-		return nil, nil
-	}
-	var b bytes.Buffer
-	gz := gzip.NewWriter(&b)
-	if _, err := gz.Write(content); err != nil {
-		return nil, fmt.Errorf("failed to compress content: %w", err)
-	}
-	if err := gz.Close(); err != nil {
-		return nil, fmt.Errorf("compress closure failure %w", err)
-	}
-	return b.Bytes(), nil
-}
-
-func hashStruct(o interface{}) string {
-	hash := fnv.New32a()
-	hash.Write([]byte(fmt.Sprintf("%v", o)))
-	intHash := hash.Sum32()
-	return fmt.Sprintf("%08x", intHash)
-}
-
-// TODO (alberto) drop this deterministic naming logic and get the name for child MachineDeployment from the status/annotation/label?
-func generateName(infraName, clusterName, suffix string) string {
-	return getName(fmt.Sprintf("%s-%s", infraName, clusterName), suffix, 43)
-}
-
-// getName returns a name given a base ("deployment-5") and a suffix ("deploy")
-// It will first attempt to join them with a dash. If the resulting name is longer
-// than maxLength: if the suffix is too long, it will truncate the base name and add
-// an 8-character hash of the [base]-[suffix] string.  If the suffix is not too long,
-// it will truncate the base, add the hash of the base and return [base]-[hash]-[suffix]
-func getName(base, suffix string, maxLength int) string {
-	if maxLength <= 0 {
-		return ""
-	}
-	name := fmt.Sprintf("%s-%s", base, suffix)
-	if len(name) <= maxLength {
-		return name
-	}
-
-	// length of -hash-
-	baseLength := maxLength - 10 - len(suffix)
-
-	// if the suffix is too long, ignore it
-	if baseLength < 0 {
-		prefix := base[0:min(len(base), max(0, maxLength-9))]
-		// Calculate hash on initial base-suffix string
-		shortName := fmt.Sprintf("%s-%s", prefix, hashStruct(name))
-		return shortName[:min(maxLength, len(shortName))]
-	}
-
-	prefix := base[0:baseLength]
-	// Calculate hash on initial base-suffix string
-	return fmt.Sprintf("%s-%s-%s", prefix, hashStruct(base), suffix)
-}
-
-// max returns the greater of its 2 inputs
-func max(a, b int) int {
-	if b > a {
-		return b
-	}
-	return a
-}
-
-// min returns the lesser of its 2 inputs
-func min(a, b int) int {
-	if b < a {
-		return b
-	}
-	return a
-}
-
-// TODO(alberto): user core apimachinery func once we update deps to fetch
-// https://github.com/kubernetes/apimachinery/commit/f0c829d684eec47c6334ae69941224e1c70f16d6#diff-e3bc08d3d017ceff366d1c1c6f16c745e576e41f711a482a08f97006d306bf2a
-// RemoveStatusCondition removes the corresponding conditionType from conditions.
-// conditions must be non-nil.
-func RemoveStatusCondition(conditions *[]metav1.Condition, conditionType string) {
-	if conditions == nil || len(*conditions) == 0 {
-		return
-	}
-
-	newConditions := make([]metav1.Condition, 0, len(*conditions)-1)
-	for _, condition := range *conditions {
-		if condition.Type != conditionType {
-			newConditions = append(newConditions, condition)
+			nodePool.Annotations[nodePoolAnnotationCanonicalDataPlaneImages] = "true"
 		}
 	}
 
-	*conditions = newConditions
+	haProxyImage, err := resolveHAProxyImage(nodePool, hcluster, releaseImage, useCanonicalImages)
+	if err != nil {
+		return "", err
+	}
+
+	haProxy := haproxy.HAProxy{
+		Client:                  r.Client,
+		HAProxyImage:            haProxyImage,
+		HypershiftOperatorImage: r.HypershiftOperatorImage,
+		ReleaseProvider:         r.ReleaseProvider,
+		ImageMetadataProvider:   r.ImageMetadataProvider,
+	}
+	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hcluster.Namespace, hcluster.Name)
+	return haProxy.GenerateHAProxyRawConfig(ctx, hcluster, controlPlaneNamespace)
+}
+
+// machinesByCreationTimestamp sorts a list of Machine by creation timestamp, using their names as a tie breaker.
+type machinesByCreationTimestamp []*capiv1.Machine
+
+func (o machinesByCreationTimestamp) Len() int      { return len(o) }
+func (o machinesByCreationTimestamp) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+func (o machinesByCreationTimestamp) Less(i, j int) bool {
+	if o[i].CreationTimestamp.Equal(&o[j].CreationTimestamp) {
+		return o[i].Name < o[j].Name
+	}
+	return o[i].CreationTimestamp.Before(&o[j].CreationTimestamp)
+}
+
+// SortedByCreationTimestamp returns the machines sorted by creation timestamp.
+func sortedByCreationTimestamp(machines []*capiv1.Machine) []*capiv1.Machine {
+	sort.Sort(machinesByCreationTimestamp(machines))
+	return machines
+}
+
+const (
+	endOfMessage                         = "... too many similar errors\n"
+	endOfGlobalMessage                   = "... message truncated\n"
+	endOfReasons                         = ",ReasonsTruncated"
+	maxMessageLength                     = 1000
+	maxGlobalMessageLength               = 3000
+	maxReasonLength                      = 1024 // +kubebuilder:validation:MaxLength on NodePoolCondition.Reason
+	aggregatorMachineStateReady          = "ready"
+	aggregatorMachineStateHealthy        = "healthy"
+	aggregatorMachineStateLiveMigratable = "live migratable"
+)
+
+func aggregateMachineReasonsAndMessages(messageMap map[string][]string, numMachines, numNotReady int, state string) (string, string) {
+	msgBuilder := &strings.Builder{}
+	reasons := make([]string, len(messageMap))
+
+	fmt.Fprintf(msgBuilder, "%d of %d machines are not %s\n", numNotReady, numMachines, state)
+
+	// as map order is not deterministic, we must sort the reasons in order to get deterministic reason and message, so
+	// we won't need to update the nodepool condition just because we've got different order from the map, the machine
+	// conditions weren't actually changed.
+	i := 0
+	for reason := range messageMap {
+		reasons[i] = reason
+		i++
+	}
+	sort.Strings(reasons)
+
+	for _, reason := range reasons {
+		// Sort messages within each reason bucket to ensure deterministic output
+		// regardless of Kubernetes list order, avoiding unnecessary status updates.
+		sort.Strings(messageMap[reason])
+		reasonBlock := aggregateMachineMessages(messageMap[reason])
+		if msgBuilder.Len()+len(reasonBlock)+len(endOfGlobalMessage) > maxGlobalMessageLength {
+			msgBuilder.WriteString(endOfGlobalMessage)
+			break
+		}
+		msgBuilder.WriteString(reasonBlock)
+	}
+
+	return truncateReasons(reasons), msgBuilder.String()
+}
+
+// truncateReasons joins reasons with commas and truncates the result to fit
+// within the NodePoolCondition.Reason MaxLength=1024 validation limit.
+// When truncation occurs, the suffix ",ReasonsTruncated" is appended.
+func truncateReasons(reasons []string) string {
+	joined := strings.Join(reasons, ",")
+	if len(joined) <= maxReasonLength {
+		return joined
+	}
+
+	// Build the truncated reason string by adding reasons one at a time,
+	// reserving space for the endOfReasons suffix.
+	builder := strings.Builder{}
+	for i, reason := range reasons {
+		separator := ""
+		if i > 0 {
+			separator = ","
+		}
+		if builder.Len()+len(separator)+len(reason)+len(endOfReasons) > maxReasonLength {
+			builder.WriteString(endOfReasons)
+			break
+		}
+		builder.WriteString(separator)
+		builder.WriteString(reason)
+	}
+
+	return builder.String()
+}
+
+func aggregateMachineMessages(msgs []string) string {
+	builder := strings.Builder{}
+	for _, msg := range msgs {
+		if builder.Len()+len(msg) > maxMessageLength {
+			// If nothing has been written yet, truncate the oversized message
+			// rather than dropping it entirely.
+			if builder.Len() == 0 {
+				remaining := maxMessageLength - len(endOfGlobalMessage)
+				builder.WriteString(msg[:remaining])
+				builder.WriteString(endOfGlobalMessage)
+				break
+			}
+			builder.WriteString(endOfMessage)
+			break
+		}
+
+		builder.WriteString(msg)
+	}
+
+	return builder.String()
+}
+
+func deleteConfigByLabel(ctx context.Context, c client.Client, lbl map[string]string, controlPlaneNamespace string) error {
+	cmList := &corev1.ConfigMapList{}
+	if err := c.List(ctx, cmList, &client.ListOptions{
+		LabelSelector: labels.SelectorFromSet(lbl),
+		Namespace:     controlPlaneNamespace,
+	}); err != nil {
+		return err
+	}
+	for i := range cmList.Items {
+		cm := &cmList.Items[i]
+		if _, err := k8sutil.DeleteIfNeeded(ctx, c, cm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileScaleFromZeroAnnotations sets scale-from-zero annotations on MachineDeployment/MachineSet.
+// It supports multiple platforms by switching on the NodePool's platform type.
+func (r *NodePoolReconciler) reconcileScaleFromZeroAnnotations(ctx context.Context, nodePool *hyperv1.NodePool, capi *CAPI) error {
+	// Get the platform-specific machine template
+	var machineTemplate interface{}
+	switch nodePool.Spec.Platform.Type {
+	case hyperv1.AWSPlatform:
+		awsMachineTemplate := &capiaws.AWSMachineTemplate{}
+		if err := capi.getExistingMachineTemplate(ctx, awsMachineTemplate); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Machine template doesn't exist yet, skip annotation (it will be reconciled later)
+				return nil
+			}
+			return fmt.Errorf("failed to get AWSMachineTemplate: %w", err)
+		}
+		machineTemplate = awsMachineTemplate
+
+	case hyperv1.AzurePlatform:
+		azureTemplate := &capiazure.AzureMachineTemplate{}
+		if err := capi.getExistingMachineTemplate(ctx, azureTemplate); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("failed to get AzureMachineTemplate: %w", err)
+		}
+		machineTemplate = azureTemplate
+
+	default:
+		return fmt.Errorf("unsupported platform for scale-from-zero: %s", nodePool.Spec.Platform.Type)
+	}
+
+	// Get the appropriate CAPI object (MachineSet for InPlace, MachineDeployment for Replace)
+	var obj client.Object
+	if nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeInPlace {
+		// InPlace mode uses MachineSet
+		ms := capi.machineSet()
+		if err := capi.Get(ctx, client.ObjectKeyFromObject(ms), ms); err != nil {
+			if apierrors.IsNotFound(err) {
+				// MachineSet doesn't exist yet, skip annotation
+				return nil
+			}
+			return fmt.Errorf("failed to get MachineSet: %w", err)
+		}
+		obj = ms
+	} else {
+		// Replace mode uses MachineDeployment
+		md := capi.machineDeployment()
+		if err := capi.Get(ctx, client.ObjectKeyFromObject(md), md); err != nil {
+			if apierrors.IsNotFound(err) {
+				// MachineDeployment doesn't exist yet, skip annotation
+				return nil
+			}
+			return fmt.Errorf("failed to get MachineDeployment: %w", err)
+		}
+		obj = md
+	}
+
+	// Create a patch base before modifying the object
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+
+	// Set scale-from-zero annotations on the object
+	if err := setScaleFromZeroAnnotationsOnObject(ctx, r.InstanceTypeProvider, nodePool, obj, machineTemplate); err != nil {
+		return fmt.Errorf("failed to set scale-from-zero annotations: %w", err)
+	}
+
+	// Patch only sends the diff, avoiding unnecessary API updates when annotations haven't changed
+	if err := capi.Patch(ctx, obj, patch); err != nil {
+		return fmt.Errorf("failed to patch with scale-from-zero annotations: %w", err)
+	}
+
+	return nil
+}
+
+// validateHCPayloadSupportsNodePoolCPUArch validates the HostedCluster payload can support the NodePool's CPU arch
+func validateHCPayloadSupportsNodePoolCPUArch(hc *hyperv1.HostedCluster, np *hyperv1.NodePool) error {
+	if hc.Status.PayloadArch == hyperv1.Multi {
+		return nil
+	}
+
+	if hc.Status.PayloadArch == hyperv1.ToPayloadArch(np.Spec.Arch) {
+		return nil
+	}
+
+	return fmt.Errorf("NodePool CPU arch, %s, is not supported by the HostedCluster payload type, %s; either change the NodePool CPU arch or use a multi-arch release image", np.Spec.Arch, hc.Status.PayloadArch)
 }

@@ -1,0 +1,6 @@
+---
+description: generating a conventional commit message when commiting to git
+alwaysApply: false
+---
+
+Read and follow the canonical commit-format policy in `../../skills/git-commit-format/SKILL.md` whenever generating commit messages or discussing commit practices.

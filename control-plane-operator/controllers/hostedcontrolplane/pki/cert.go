@@ -2,14 +2,11 @@ package pki
 
 import (
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"fmt"
-	"net"
+
+	"github.com/openshift/hypershift/support/certs"
+	"github.com/openshift/hypershift/support/config"
 
 	corev1 "k8s.io/api/core/v1"
-
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/config"
-	"github.com/openshift/hypershift/support/certs"
 )
 
 var (
@@ -21,55 +18,27 @@ var (
 	X509SignerUsage  = X509DefaultUsage | x509.KeyUsageCertSign
 )
 
-func reconcileSignedCert(secret *corev1.Secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, usage x509.KeyUsage, extUsages []x509.ExtKeyUsage) error {
-	return reconcileSignedCertWithKeys(secret, ca, ownerRef, cn, org, usage, extUsages, corev1.TLSCertKey, corev1.TLSPrivateKeyKey, CASignerCertMapKey)
+func reconcileSignedCert(secret *corev1.Secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, extUsages []x509.ExtKeyUsage) error {
+	return reconcileSignedCertWithKeys(secret, ca, ownerRef, cn, org, extUsages, corev1.TLSCertKey, corev1.TLSPrivateKeyKey, certs.CASignerCertMapKey)
 }
 
-func reconcileSignedCertWithKeys(secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, usage x509.KeyUsage, extUsages []x509.ExtKeyUsage, crtKey, keyKey, caKey string) error {
-	return reconcileSignedCertWithKeysAndAddresses(secret, ca, ownerRef, cn, org, usage, extUsages, crtKey, keyKey, caKey, nil, nil)
+func reconcileSignedCertWithKeys(secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, extUsages []x509.ExtKeyUsage, crtKey, keyKey, caKey string) error {
+	return reconcileSignedCertWithKeysAndAddresses(secret, ca, ownerRef, cn, org, extUsages, crtKey, keyKey, caKey, nil, nil, "")
 }
 
-func reconcileSignedCertWithAddresses(secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, usage x509.KeyUsage, extUsages []x509.ExtKeyUsage, dnsNames []string, ips []string) error {
-	return reconcileSignedCertWithKeysAndAddresses(secret, ca, ownerRef, cn, org, usage, extUsages, corev1.TLSCertKey, corev1.TLSPrivateKeyKey, CASignerCertMapKey, dnsNames, ips)
+func reconcileSignedCertWithAddresses(secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, extUsages []x509.ExtKeyUsage, dnsNames []string, ips []string) error {
+	return reconcileSignedCertWithKeysAndAddresses(secret, ca, ownerRef, cn, org, extUsages, corev1.TLSCertKey, corev1.TLSPrivateKeyKey, certs.CASignerCertMapKey, dnsNames, ips, "")
 }
 
-func reconcileSignedCertWithKeysAndAddresses(secret *corev1.Secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, usage x509.KeyUsage, extUsages []x509.ExtKeyUsage, crtKey, keyKey, caKey string, dnsNames []string, ips []string) error {
+func reconcileSignedCertWithAddressesAndSecretType(secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, extUsages []x509.ExtKeyUsage, dnsNames []string, ips []string, secretType corev1.SecretType) error {
+	return reconcileSignedCertWithKeysAndAddresses(secret, ca, ownerRef, cn, org, extUsages, corev1.TLSCertKey, corev1.TLSPrivateKeyKey, certs.CASignerCertMapKey, dnsNames, ips, secretType)
+}
+
+func reconcileSignedCertWithKeysAndAddresses(secret *corev1.Secret, ca *corev1.Secret, ownerRef config.OwnerRef, cn string, org []string, extUsages []x509.ExtKeyUsage, crtKey string, keyKey string, caKey string, dnsNames []string, ips []string, secretType corev1.SecretType) error {
 	ownerRef.ApplyTo(secret)
-	if !ValidCA(ca) {
-		return fmt.Errorf("invalid CA signer secret %s for cert(cn=%s,o=%v)", ca.Name, cn, org)
-	}
-	expectedKeys := []string{crtKey, keyKey, caKey}
 	secret.Type = corev1.SecretTypeOpaque
-	if SignedSecretUpToDate(secret, ca, expectedKeys) {
-		return nil
+	if secretType != "" {
+		secret.Type = secretType
 	}
-	var ipAddresses []net.IP
-	for _, ip := range ips {
-		address := net.ParseIP(ip)
-		if address == nil {
-			return fmt.Errorf("invalid IP address %s for cert(cn=%s,o=%v)", ip, cn, org)
-		}
-		ipAddresses = append(ipAddresses, address)
-	}
-
-	cfg := &certs.CertCfg{
-		Subject:      pkix.Name{CommonName: cn, Organization: org},
-		KeyUsages:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsages: extUsages,
-		Validity:     certs.ValidityOneYear,
-		DNSNames:     dnsNames,
-		IPAddresses:  ipAddresses,
-	}
-	certBytes, keyBytes, caBytes, err := SignCertificate(cfg, ca)
-	if err != nil {
-		return fmt.Errorf("error signing cert(cn=%s,o=%v): %w", cn, org, err)
-	}
-	if secret.Data == nil {
-		secret.Data = map[string][]byte{}
-	}
-	secret.Data[crtKey] = certBytes
-	secret.Data[keyKey] = keyBytes
-	secret.Data[caKey] = caBytes
-	AnnotateWithCA(secret, ca)
-	return nil
+	return certs.ReconcileSignedCert(secret, ca, cn, org, extUsages, crtKey, keyKey, caKey, dnsNames, ips)
 }

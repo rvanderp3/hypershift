@@ -130,13 +130,14 @@ func readKeyName(delimiters string, in []byte) (string, int, error) {
 
 	// Check if key name surrounded by quotes.
 	var keyQuote string
-	if line[0] == '"' {
+	switch line[0] {
+	case '"':
 		if len(line) > 6 && line[0:3] == `"""` {
 			keyQuote = `"""`
 		} else {
 			keyQuote = `"`
 		}
-	} else if line[0] == '`' {
+	case '`':
 		keyQuote = "`"
 	}
 
@@ -164,6 +165,10 @@ func readKeyName(delimiters string, in []byte) (string, int, error) {
 	if endIdx < 0 {
 		return "", -1, ErrDelimiterNotFound{line}
 	}
+	if endIdx == 0 {
+		return "", -1, ErrEmptyKeyName{line}
+	}
+
 	return strings.TrimSpace(line[0:endIdx]), endIdx + 1, nil
 }
 
@@ -177,6 +182,13 @@ func (p *parser) readMultilines(line, val, valQuote string) (string, error) {
 
 		pos := strings.LastIndex(next, valQuote)
 		if pos > -1 {
+			// Check if the line ends with backslash continuation after the quote
+			restOfLine := strings.TrimRight(next[pos+len(valQuote):], "\r\n")
+			if !p.options.IgnoreContinuation && strings.HasSuffix(strings.TrimSpace(restOfLine), `\`) {
+				val += next
+				continue
+			}
+
 			val += next[:pos]
 
 			comment, has := cleanComment([]byte(next[pos:]))
@@ -249,7 +261,7 @@ func (p *parser) readValue(in []byte, bufferSize int) (string, error) {
 		}
 
 		if p.options.UnescapeValueDoubleQuotes && valQuote == `"` {
-			return strings.Replace(line[startIdx:pos+startIdx], `\"`, `"`, -1), nil
+			return strings.ReplaceAll(line[startIdx:pos+startIdx], `\"`, `"`), nil
 		}
 		return line[startIdx : pos+startIdx], nil
 	}
@@ -302,15 +314,9 @@ func (p *parser) readPythonMultilines(line string, bufferSize int) (string, erro
 	parserBufferPeekResult, _ := p.buf.Peek(bufferSize)
 	peekBuffer := bytes.NewBuffer(parserBufferPeekResult)
 
-	indentSize := 0
 	for {
 		peekData, peekErr := peekBuffer.ReadBytes('\n')
-		if peekErr != nil {
-			if peekErr == io.EOF {
-				p.debug("readPythonMultilines: io.EOF, peekData: %q, line: %q", string(peekData), line)
-				return line, nil
-			}
-
+		if peekErr != nil && peekErr != io.EOF {
 			p.debug("readPythonMultilines: failed to peek with error: %v", peekErr)
 			return "", peekErr
 		}
@@ -329,19 +335,6 @@ func (p *parser) readPythonMultilines(line string, bufferSize int) (string, erro
 			return line, nil
 		}
 
-		// Determine indent size and line prefix.
-		currentIndentSize := len(peekMatches[1])
-		if indentSize < 1 {
-			indentSize = currentIndentSize
-			p.debug("readPythonMultilines: indent size is %d", indentSize)
-		}
-
-		// Make sure each line is indented at least as far as first line.
-		if currentIndentSize < indentSize {
-			p.debug("readPythonMultilines: end of value, current indent: %d, expected indent: %d, line: %q", currentIndentSize, indentSize, line)
-			return line, nil
-		}
-
 		// Advance the parser reader (buffer) in-sync with the peek buffer.
 		_, err := p.buf.Discard(len(peekData))
 		if err != nil {
@@ -349,8 +342,7 @@ func (p *parser) readPythonMultilines(line string, bufferSize int) (string, erro
 			return "", err
 		}
 
-		// Handle indented empty line.
-		line += "\n" + peekMatches[1][indentSize:] + peekMatches[2]
+		line += "\n" + peekMatches[0]
 	}
 }
 
@@ -461,6 +453,8 @@ func (f *File) parse(reader io.Reader) (err error) {
 			// Reset auto-counter and comments
 			p.comment.Reset()
 			p.count = 1
+			// Nested values can't span sections
+			isLastValueEmpty = false
 
 			inUnparseableSection = false
 			for i := range f.options.UnparseableSections {
@@ -481,8 +475,9 @@ func (f *File) parse(reader io.Reader) (err error) {
 
 		kname, offset, err := readKeyName(f.options.KeyValueDelimiters, line)
 		if err != nil {
+			switch {
 			// Treat as boolean key when desired, and whole line is key name.
-			if IsErrDelimiterNotFound(err) {
+			case IsErrDelimiterNotFound(err):
 				switch {
 				case f.options.AllowBooleanKeys:
 					kname, err := p.readValue(line, parserBufferSize)
@@ -500,6 +495,8 @@ func (f *File) parse(reader io.Reader) (err error) {
 				case f.options.SkipUnrecognizableLines:
 					continue
 				}
+			case IsErrEmptyKeyName(err) && f.options.SkipUnrecognizableLines:
+				continue
 			}
 			return err
 		}

@@ -1,11 +1,11 @@
 package upsert
 
 import (
-	"context"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -22,7 +22,7 @@ func TestCreateOrUpdate(t *testing.T) {
 	}).Build()
 
 	deployment := &appsv1.Deployment{}
-	result, err := (&createOrUpdateProvider{}).CreateOrUpdate(context.Background(), client, deployment, func() error { return nil })
+	result, err := (&createOrUpdateProvider{}).CreateOrUpdate(t.Context(), client, deployment, func() error { return nil })
 	if err != nil {
 		t.Fatalf("CreateOrUpdate failed: %v", err)
 	}

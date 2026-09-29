@@ -5,31 +5,32 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
 
-	"github.com/spf13/cobra"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/cmd/util"
+	"github.com/openshift/hypershift/support/netutil"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kubejson "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/types"
 	clientcmdapiv1 "k8s.io/client-go/tools/clientcmd/api/v1"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
-	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
-	"github.com/openshift/hypershift/cmd/util"
+	"github.com/spf13/cobra"
 )
 
 // TODO: NEXT: incorporate into an fzf workflow
 
-const description string = `
+const Description string = `
 This command renders kubeconfigs for HostedClusters.
 
-If a single cluster is identified, the kubeconfig is printed to stdout.
+If a single cluster is specified, the kubeconfig is printed to stdout.
 
-If no clusters is identified, this command renders a kubeconfig with a context
+If no clusters are specified, this command renders a kubeconfig with a context
 for every HostedCluster resource. The contexts are named based on the
 HostedCluster following the pattern:
 
@@ -39,9 +40,10 @@ The kubeconfig for each cluster is based on the secret referenced by the status
 of the HostedCluster itself.
 `
 
-type Options struct {
-	Namespace string
-	Name      string
+type options struct {
+	namespace   string
+	name        string
+	portForward bool
 }
 
 // NewCreateCommand returns a command which can render kubeconfigs for HostedCluster
@@ -49,36 +51,32 @@ type Options struct {
 func NewCreateCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "kubeconfig",
-		Short:        "Renders kubeconfigs for hostedcluster resources.",
-		Long:         description,
+		Short:        "Renders kubeconfigs for HostedCluster resources",
+		Long:         Description,
 		SilenceUsage: true,
 	}
 
-	opts := Options{Namespace: "clusters"}
+	opts := options{
+		namespace: "clusters",
+	}
 
-	cmd.Flags().StringVar(&opts.Namespace, "namespace", opts.Namespace, "A hostedcluster namespace")
-	cmd.Flags().StringVar(&opts.Name, "name", opts.Name, "A hostedcluster name")
+	cmd.Flags().StringVar(&opts.namespace, "namespace", opts.namespace, "A HostedCluster namespace. Defaults to 'clusters'.")
+	cmd.Flags().StringVar(&opts.name, "name", opts.name, "A HostedCluster name.")
+	cmd.Flags().BoolVar(&opts.portForward, "port-forward", false, "For private clusters, rewrite the kubeconfig server URL for use with kubectl port-forward.")
 
-	cmd.Run = func(cmd *cobra.Command, args []string) {
-		ctx, cancel := context.WithCancel(context.Background())
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT)
-		go func() {
-			<-sigs
-			cancel()
-		}()
-
-		if err := render(ctx, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", err)
-			os.Exit(2)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if err := Render(cmd.Context(), opts.namespace, opts.name, opts.portForward); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+			return err
 		}
+		return nil
 	}
 
 	return cmd
 }
 
-// render builds the kubeconfig and prints it to stdout.
-func render(ctx context.Context, opts Options) error {
+// Render builds the kubeconfig and prints it to stdout.
+func Render(ctx context.Context, namespace string, name string, portForward bool) error {
 	scheme := runtime.NewScheme()
 	if err := clientcmdapiv1.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("failed to set up scheme: %w", err)
@@ -87,12 +85,15 @@ func render(ctx context.Context, opts Options) error {
 		kubejson.DefaultMetaFactory, scheme, scheme,
 		kubejson.SerializerOptions{Yaml: true, Pretty: true, Strict: true},
 	)
-	c := util.GetClientOrDie()
+	c, err := util.GetClient()
+	if err != nil {
+		return err
+	}
 
 	var kubeConfig *clientcmdapiv1.Config
 	switch {
-	case len(opts.Name) == 0:
-		config, err := buildCombinedConfig(ctx, c)
+	case len(name) == 0:
+		config, err := buildCombinedConfig(ctx, c, namespace, portForward)
 		if err != nil {
 			return fmt.Errorf("failed to make kubeconfig: %w", err)
 		}
@@ -100,7 +101,7 @@ func render(ctx context.Context, opts Options) error {
 		return serializer.Encode(kubeConfig, os.Stdout)
 	default:
 		var cluster hyperv1.HostedCluster
-		if err := c.Get(ctx, types.NamespacedName{Namespace: opts.Namespace, Name: opts.Name}, &cluster); err != nil {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &cluster); err != nil {
 			return err
 		}
 		if cluster.Status.KubeConfig == nil {
@@ -113,11 +114,17 @@ func render(ctx context.Context, opts Options) error {
 			},
 		}
 		if err := c.Get(ctx, client.ObjectKeyFromObject(&kubeConfigSecret), &kubeConfigSecret); err != nil {
-			return fmt.Errorf("failed to get kubeconfig secret %s: %s", client.ObjectKeyFromObject(&kubeConfigSecret), err)
+			return fmt.Errorf("failed to get kubeconfig secret %s: %w", client.ObjectKeyFromObject(&kubeConfigSecret), err)
 		}
 		data, hasData := kubeConfigSecret.Data["kubeconfig"]
 		if !hasData || len(data) == 0 {
 			return fmt.Errorf("kubeconfig secret has no kubeconfig")
+		}
+		if portForward && netutil.IsPrivateHC(&cluster) {
+			data, err = rewriteServerForPrivateCluster(ctx, c, &cluster, data)
+			if err != nil {
+				return fmt.Errorf("failed to rewrite kubeconfig for private cluster: %w", err)
+			}
 		}
 		fmt.Print(string(data))
 		return nil
@@ -133,10 +140,10 @@ type NamedConfig struct {
 // buildCombinedConfig finds the kubeconfigs for all HostedClusters which report
 // one and merges them into a single kubeconfig. The generated admin context for
 // each cluster will follow the pattern: {hostedcluster.namespace}-{hostedcluster.name}
-func buildCombinedConfig(ctx context.Context, c client.Client) (*clientcmdapiv1.Config, error) {
+func buildCombinedConfig(ctx context.Context, c client.Client, namespace string, portForward bool) (*clientcmdapiv1.Config, error) {
 	// Select clusters.
 	var clusters hyperv1.HostedClusterList
-	if err := c.List(context.TODO(), &clusters); err != nil {
+	if err := c.List(ctx, &clusters, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list hostedclusters: %w", err)
 	}
 	var filtered []hyperv1.HostedCluster
@@ -168,6 +175,14 @@ func buildCombinedConfig(ctx context.Context, c client.Client) (*clientcmdapiv1.
 			log.Printf("missing kubeconfig contents")
 			continue
 		}
+		if portForward && netutil.IsPrivateHC(&cluster) {
+			var err error
+			data, err = rewriteServerForPrivateCluster(ctx, c, &cluster, data)
+			if err != nil {
+				log.Printf("failed to rewrite kubeconfig for private cluster %s: %s", cluster.Name, err)
+				continue
+			}
+		}
 		var kubeConfig clientcmdapiv1.Config
 		if err := yaml.Unmarshal(data, &kubeConfig); err != nil {
 			log.Printf("failed to load kubeconfig: %s\nraw data:\n%s\n", err, data)
@@ -194,11 +209,43 @@ func buildCombinedConfig(ctx context.Context, c client.Client) (*clientcmdapiv1.
 	return merged, nil
 }
 
+// rewriteServerForPrivateCluster rewrites the server URL in a kubeconfig to use
+// the KAS service ClusterIP on the management cluster. Private clusters don't
+// have a resolvable public API hostname, so the kubeconfig must point to the
+// KAS service directly.
+func rewriteServerForPrivateCluster(ctx context.Context, c client.Client, cluster *hyperv1.HostedCluster, data []byte) ([]byte, error) {
+	controlPlaneNamespace := fmt.Sprintf("%s-%s", cluster.Namespace, cluster.Name)
+	kasSvc := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kube-apiserver",
+			Namespace: controlPlaneNamespace,
+		},
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(&kasSvc), &kasSvc); err != nil {
+		return nil, fmt.Errorf("failed to get kube-apiserver service in %s: %w", controlPlaneNamespace, err)
+	}
+	port := int32(6443)
+	if len(kasSvc.Spec.Ports) > 0 {
+		port = kasSvc.Spec.Ports[0].Port
+	}
+
+	var kubeConfig clientcmdapiv1.Config
+	if err := yaml.Unmarshal(data, &kubeConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
+	}
+	for i := range kubeConfig.Clusters {
+		kubeConfig.Clusters[i].Cluster.Server = fmt.Sprintf("https://localhost:%d", port)
+	}
+	log.Printf("NOTE: This is a private cluster. Run this port-forward in another terminal first:")
+	log.Printf("  kubectl port-forward -n %s svc/kube-apiserver %d:%d", controlPlaneNamespace, port, port)
+	return yaml.Marshal(&kubeConfig)
+}
+
 // mergeClusterKubeConfigs merges the given kubeconfigs by naming the cluster,
 // auth, and context fields according to the given NamedConfig name which is
 // assumed to be a unique name representing the HostedCluster.
 //
-// This function assumes the the first element of the cluster and auth fields
+// This function assumes the first element of the cluster and auth fields
 // combined represent an admin context for the cluster.
 func mergeClusterKubeConfigs(clusterConfigs []NamedConfig) *clientcmdapiv1.Config {
 	merged := clientcmdapiv1.Config{

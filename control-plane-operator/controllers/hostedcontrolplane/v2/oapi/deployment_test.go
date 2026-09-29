@@ -1,0 +1,387 @@
+package oapi
+
+import (
+	"testing"
+
+	. "github.com/onsi/gomega"
+
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/v2/assets"
+	"github.com/openshift/hypershift/support/api"
+	component "github.com/openshift/hypershift/support/controlplane-component"
+	"github.com/openshift/hypershift/support/podspec"
+
+	configv1 "github.com/openshift/api/config/v1"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+)
+
+func TestReconcileOpenshiftAPIServerDeploymentTrustBundle(t *testing.T) {
+	hcp := &hyperv1.HostedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hcp",
+			Namespace: "test",
+		},
+	}
+
+	testCases := []struct {
+		name                         string
+		expectedVolume               *corev1.Volume
+		additionalTrustBundle        *corev1.LocalObjectReference
+		clusterConf                  *hyperv1.ClusterConfiguration
+		imageRegistryAdditionalCAs   *corev1.ConfigMap
+		expectProjectedVolumeMounted bool
+	}{
+		{
+			name: "Trust bundle provided",
+			additionalTrustBundle: &corev1.LocalObjectReference{
+				Name: "user-ca-bundle",
+			},
+			expectedVolume: &corev1.Volume{
+				Name: "additional-trust-bundle",
+				VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{
+						Sources:     []corev1.VolumeProjection{getFakeVolumeProjectionCABundle()},
+						DefaultMode: ptr.To[int32](420),
+					},
+				},
+			},
+			expectProjectedVolumeMounted: true,
+		},
+		{
+			name:                         "Trust bundle not provided",
+			expectedVolume:               nil,
+			additionalTrustBundle:        nil,
+			expectProjectedVolumeMounted: false,
+		},
+		{
+			name: "Trust bundle and image registry additional CAs provided",
+			additionalTrustBundle: &corev1.LocalObjectReference{
+				Name: "user-ca-bundle",
+			},
+			imageRegistryAdditionalCAs: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "image-registry-additional-ca",
+					Namespace: hcp.Namespace,
+				},
+				Data: map[string]string{
+					"registry1": "fake-bundle",
+					"registry2": "fake-bundle-2",
+				},
+			},
+			clusterConf: &hyperv1.ClusterConfiguration{
+				Image: &configv1.ImageSpec{
+					AdditionalTrustedCA: configv1.ConfigMapNameReference{
+						Name: "image-registry-additional-ca",
+					},
+				},
+			},
+			expectedVolume: &corev1.Volume{
+				Name: "additional-trust-bundle",
+				VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{
+						Sources:     []corev1.VolumeProjection{getFakeVolumeProjectionCABundle(), getFakeVolumeProjectionImageRegistryCAs()},
+						DefaultMode: ptr.To[int32](420),
+					},
+				},
+			},
+			expectProjectedVolumeMounted: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+
+			fakeClientBuilder := fake.NewClientBuilder().WithScheme(api.Scheme)
+			if tc.imageRegistryAdditionalCAs != nil {
+				fakeClientBuilder.WithObjects(tc.imageRegistryAdditionalCAs)
+			}
+			hcp.Spec.Configuration = tc.clusterConf
+			hcp.Spec.AdditionalTrustBundle = tc.additionalTrustBundle
+			cpContext := component.WorkloadContext{
+				Client: fakeClientBuilder.Build(),
+				HCP:    hcp,
+			}
+
+			oapiDeployment, err := assets.LoadDeploymentManifest(ComponentName)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			err = adaptDeployment(cpContext, oapiDeployment)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			if tc.expectProjectedVolumeMounted {
+				g.Expect(oapiDeployment.Spec.Template.Spec.Volumes).To(ContainElement(*tc.expectedVolume))
+			} else {
+				g.Expect(oapiDeployment.Spec.Template.Spec.Volumes).NotTo(ContainElement(&corev1.Volume{Name: "additional-trust-bundle"}))
+			}
+		})
+	}
+}
+
+func getFakeVolumeProjectionCABundle() corev1.VolumeProjection {
+	return corev1.VolumeProjection{
+		ConfigMap: &corev1.ConfigMapProjection{
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: "user-ca-bundle",
+			},
+			Items: []corev1.KeyToPath{
+				{
+					Key:  "ca-bundle.crt",
+					Path: "additional-ca-bundle.pem",
+				},
+			},
+		},
+	}
+}
+
+func getFakeVolumeProjectionImageRegistryCAs() corev1.VolumeProjection {
+	return corev1.VolumeProjection{
+		ConfigMap: &corev1.ConfigMapProjection{
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: "image-registry-additional-ca",
+			},
+			Items: []corev1.KeyToPath{
+				{
+					Key:  "registry1",
+					Path: "image-registry-1.pem",
+				},
+				{
+					Key:  "registry2",
+					Path: "image-registry-2.pem",
+				},
+			},
+		},
+	}
+}
+
+func TestAdaptCombinedPullSecret(t *testing.T) {
+	validPullSecret := []byte(`{"auths":{"registry.redhat.io":{"auth":"dXNlcjpwYXNz"}}}`)
+	mergedData := []byte(`{"auths":{"registry.redhat.io":{"auth":"dXNlcjpwYXNz"},"custom.io":{"auth":"Y3VzdG9t"}}}`)
+
+	tests := []struct {
+		name           string
+		existingData   []byte
+		pullSecretData []byte
+		expectedData   []byte
+	}{
+		{
+			name:           "Upgrade skew: combined-pull-secret absent, should bootstrap from pull-secret",
+			pullSecretData: validPullSecret,
+			expectedData:   validPullSecret,
+		},
+		{
+			name:         "Steady state: HCCO has merged additional credentials, should preserve them",
+			existingData: mergedData,
+			expectedData: mergedData,
+		},
+		{
+			name:           "Upgrade skew with empty pull-secret data, should set empty data",
+			pullSecretData: []byte(`{}`),
+			expectedData:   []byte(`{}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			hcp := &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hcp",
+					Namespace: "test-ns",
+				},
+			}
+
+			fakeObjects := []crclient.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: "test-ns"},
+					Data:       map[string][]byte{corev1.DockerConfigJsonKey: tt.pullSecretData},
+				},
+			}
+
+			cpContext := component.WorkloadContext{
+				Client: fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(fakeObjects...).Build(),
+				HCP:    hcp,
+			}
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "combined-pull-secret", Namespace: "test-ns"},
+			}
+			if tt.existingData != nil {
+				secret.Data = map[string][]byte{corev1.DockerConfigJsonKey: tt.existingData}
+			}
+
+			err := adaptCombinedPullSecret(cpContext, secret)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(secret.Data[corev1.DockerConfigJsonKey]).To(Equal(tt.expectedData))
+		})
+	}
+}
+
+func TestAdaptCombinedPullSecretMissingPullSecret(t *testing.T) {
+	g := NewWithT(t)
+
+	hcp := &hyperv1.HostedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hcp",
+			Namespace: "test-ns",
+		},
+	}
+
+	cpContext := component.WorkloadContext{
+		Client: fake.NewClientBuilder().WithScheme(api.Scheme).Build(),
+		HCP:    hcp,
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "combined-pull-secret", Namespace: "test-ns"},
+	}
+
+	err := adaptCombinedPullSecret(cpContext, secret)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("failed to get pull-secret"))
+}
+
+func TestResolveOAPIVerbosity(t *testing.T) {
+	logLevel := func(l hyperv1.LogLevel) hyperv1.OpenShiftAPIServerOperatorSpec {
+		return hyperv1.OpenShiftAPIServerOperatorSpec{
+			ComponentLogLevelSpec: hyperv1.ComponentLogLevelSpec{LogLevel: l},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		hcp      *hyperv1.HostedControlPlane
+		expected int
+	}{
+		{
+			name: "When no operatorConfiguration is set, it should default to verbosity 2",
+			hcp: &hyperv1.HostedControlPlane{
+				Spec: hyperv1.HostedControlPlaneSpec{},
+			},
+			expected: 2,
+		},
+		{
+			name: "When operatorConfiguration exists but openShiftAPIServer logLevel is nil, it should default to verbosity 2",
+			hcp: &hyperv1.HostedControlPlane{
+				Spec: hyperv1.HostedControlPlaneSpec{
+					OperatorConfiguration: &hyperv1.OperatorConfiguration{},
+				},
+			},
+			expected: 2,
+		},
+		{
+			name: "When openShiftAPIServer logLevel is Normal, it should return verbosity 2",
+			hcp: &hyperv1.HostedControlPlane{
+				Spec: hyperv1.HostedControlPlaneSpec{
+					OperatorConfiguration: &hyperv1.OperatorConfiguration{
+						OpenShiftAPIServer: logLevel(hyperv1.Normal),
+					},
+				},
+			},
+			expected: 2,
+		},
+		{
+			name: "When openShiftAPIServer logLevel is Debug, it should return verbosity 4",
+			hcp: &hyperv1.HostedControlPlane{
+				Spec: hyperv1.HostedControlPlaneSpec{
+					OperatorConfiguration: &hyperv1.OperatorConfiguration{
+						OpenShiftAPIServer: logLevel(hyperv1.Debug),
+					},
+				},
+			},
+			expected: 4,
+		},
+		{
+			name: "When openShiftAPIServer logLevel is Trace, it should return verbosity 6",
+			hcp: &hyperv1.HostedControlPlane{
+				Spec: hyperv1.HostedControlPlaneSpec{
+					OperatorConfiguration: &hyperv1.OperatorConfiguration{
+						OpenShiftAPIServer: logLevel(hyperv1.Trace),
+					},
+				},
+			},
+			expected: 6,
+		},
+		{
+			name: "When openShiftAPIServer logLevel is TraceAll, it should return verbosity 8",
+			hcp: &hyperv1.HostedControlPlane{
+				Spec: hyperv1.HostedControlPlaneSpec{
+					OperatorConfiguration: &hyperv1.OperatorConfiguration{
+						OpenShiftAPIServer: logLevel(hyperv1.TraceAll),
+					},
+				},
+			},
+			expected: 8,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(resolveOAPIVerbosity(tt.hcp)).To(Equal(tt.expected))
+		})
+	}
+}
+
+func TestAdaptDeploymentOAPILogLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		hcp      *hyperv1.HostedControlPlane
+		expected string
+	}{
+		{
+			name: "When no operatorConfiguration is set, it should default to --v=2",
+			hcp: &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hcp",
+					Namespace: "test-ns",
+				},
+			},
+			expected: "--v=2",
+		},
+		{
+			name: "When logLevel is Debug, it should set --v=4",
+			hcp: &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hcp",
+					Namespace: "test-ns",
+				},
+				Spec: hyperv1.HostedControlPlaneSpec{
+					OperatorConfiguration: &hyperv1.OperatorConfiguration{
+						OpenShiftAPIServer: hyperv1.OpenShiftAPIServerOperatorSpec{
+							ComponentLogLevelSpec: hyperv1.ComponentLogLevelSpec{LogLevel: hyperv1.Debug},
+						},
+					},
+				},
+			},
+			expected: "--v=4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+
+			deployment, err := assets.LoadDeploymentManifest(ComponentName)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			cpContext := component.WorkloadContext{
+				Client: fake.NewClientBuilder().WithScheme(api.Scheme).Build(),
+				HCP:    tt.hcp,
+			}
+
+			err = adaptDeployment(cpContext, deployment)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			container := podspec.FindContainer(ComponentName, deployment.Spec.Template.Spec.Containers)
+			g.Expect(container).ToNot(BeNil())
+			g.Expect(container.Args).To(ContainElement(tt.expected))
+		})
+	}
+}

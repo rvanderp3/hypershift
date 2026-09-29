@@ -1,17 +1,21 @@
-IMG ?= quay.io/hypershift/mkdocs-material:latest
+RUNTIME ?= $(shell sh ../hack/utils.sh get_container_engine)
+IMG ?= docker.io/zensical/zensical:0.0.51
 
 .PHONY: build
 build:
-	mkdocs build
+	uv run --frozen zensical build --strict
 
 .PHONY: build-containerized
 build-containerized:
-	docker run --rm -it -v ${PWD}:/docs $(IMG) build
+	$(RUNTIME) volume create --ignore hypershift-docs-site
+	$(RUNTIME) run --rm -it \
+		-v ${PWD}:/docs:Z \
+		-v hypershift-docs-site:/docs/site \
+		$(IMG) build --strict
 
 .PHONY: serve-containerized
 serve-containerized:
-	docker run --rm -it -p 8000:8000 -v ${PWD}:/docs $(IMG) serve --dev-addr 0.0.0.0:8000
-
-.PHONY: image
-image:
-	docker build -t $(IMG) .
+	$(RUNTIME) run --rm -it -p 8000:8000 \
+		-v ${PWD}:/docs:Z \
+		-v hypershift-docs-site:/docs/site \
+		$(IMG)

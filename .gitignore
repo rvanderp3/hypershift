@@ -9,7 +9,7 @@ bin
 tools/bin
 
 # Test binary, build with `go test -c`
-*.test
+!vendor/**/*.test
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
@@ -25,7 +25,41 @@ tools/bin
 *~
 .vscode
 .envrc
+!vendor/**/.envrc
+.env
+.DS_Store
+.serena/*
+.claude/.headroom*
 
 .kube
 /kubeconfig
-.dockerignore
+.docker
+
+# ignore util binaries
+/contrib/cleanzones/cleanzones
+/contrib/cleanzones-azure/cleanzones-azure
+/contrib/cleanroles/cleanroles
+/contrib/admission-tracer/admission-tracer
+
+# SNYK CLI cache data
+.dccache
+
+# Mocked interface generate through mockgen
+*_mock.go
+
+# Claude Code working directory
+.work/
+.claude/worktrees/
+
+# dev
+/dev/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.egg

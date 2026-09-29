@@ -8,10 +8,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/blang/semver"
 	imageapi "github.com/openshift/api/image/v1"
+
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	"github.com/blang/semver"
+	"github.com/coreos/stream-metadata-go/stream"
 )
 
 // Provider knows how to find the release image metadata for an image referred
@@ -20,47 +23,71 @@ type Provider interface {
 	Lookup(ctx context.Context, image string, pullSecret []byte) (*ReleaseImage, error)
 }
 
+//go:generate ../../hack/tools/bin/mockgen -source=releaseinfo.go -package=releaseinfo -destination=providerwithregistryoverrides_mock.go
+type ProviderWithRegistryOverrides interface {
+	Provider
+	GetRegistryOverrides() map[string]string
+}
+
+type ProviderWithOpenShiftImageRegistryOverrides interface {
+	ProviderWithRegistryOverrides
+	GetOpenShiftImageRegistryOverrides() map[string][]string
+	GetMirroredReleaseImage() string
+}
+
+const (
+	// StreamRHEL9 is the canonical stream name for RHEL 9.
+	// This value must match api/hypershift/v1beta1.OSImageStreamRHEL9.
+	StreamRHEL9 = "rhel-9"
+	// StreamRHEL10 is the canonical stream name for RHEL 10.
+	// This value must match api/hypershift/v1beta1.OSImageStreamRHEL10.
+	StreamRHEL10 = "rhel-10"
+)
+
 // ReleaseImage wraps an ImageStream with some utilities that help the user
 // discover constituent component image information.
 type ReleaseImage struct {
 	*imageapi.ImageStream `json:",inline"`
-	StreamMetadata        *CoreOSStreamMetadata `json:"streamMetadata"`
+	StreamMetadata        *stream.Stream `json:"streamMetadata"`
+	// OSStreams holds per-stream metadata parsed from the ConfigMap "streams" key.
+	// Nil for single-stream payloads (OCP < 5.0).
+	OSStreams map[string]*stream.Stream `json:"-"`
+
+	// canonicalComponentImages holds component images before any registry
+	// overrides are applied. Set by RegistryMirrorProviderDecorator.
+	canonicalComponentImages map[string]string
 }
 
-type CoreOSStreamMetadata struct {
-	Stream        string                        `json:"stream"`
-	Architectures map[string]CoreOSArchitecture `json:"architectures"`
-}
-
-type CoreOSArchitecture struct {
-	// Artifacts is a map of platform name to Artifacts
-	Artifacts map[string]CoreOSArtifact `json:"artifacts"`
-	Images    CoreOSImages              `json:"images"`
-}
-
-type CoreOSArtifact struct {
-	Release string                             `json:"release"`
-	Formats map[string]map[string]CoreOSFormat `json:"formats"`
-}
-
-type CoreOSFormat struct {
-	Location           string `json:"location"`
-	Signature          string `json:"signature"`
-	SHA256             string `json:"sha256"`
-	UncompressedSHA256 string `json:"uncompressed-sha256"`
-}
-
-type CoreOSImages struct {
-	AWS CoreOSAWSImages `json:"aws"`
-}
-
-type CoreOSAWSImages struct {
-	Regions map[string]CoreOSAWSImage `json:"regions"`
-}
-
-type CoreOSAWSImage struct {
-	Release string `json:"release"`
-	Image   string `json:"image"`
+// StreamForName returns stream metadata by name. If name is empty, returns
+// the default stream (StreamMetadata). If name is non-empty, looks up
+// OSStreams and returns an error if the named stream is not found.
+func (i *ReleaseImage) StreamForName(name string) (*stream.Stream, error) {
+	if name == "" {
+		if i.StreamMetadata == nil {
+			return nil, fmt.Errorf("no default stream metadata available")
+		}
+		return i.StreamMetadata, nil
+	}
+	if i.OSStreams != nil {
+		meta, ok := i.OSStreams[name]
+		if !ok || meta == nil {
+			available := make([]string, 0, len(i.OSStreams))
+			for k, v := range i.OSStreams {
+				if v != nil {
+					available = append(available, k)
+				}
+			}
+			sort.Strings(available)
+			return nil, fmt.Errorf("stream %q not found; available streams: %v", name, available)
+		}
+		return meta, nil
+	}
+	// Fallback to legacy StreamMetadata for single-stream payloads (OCP < 5.0)
+	// where OSStreams is nil but StreamMetadata carries the data.
+	if i.StreamMetadata != nil {
+		return i.StreamMetadata, nil
+	}
+	return nil, fmt.Errorf("stream %q not found and no default stream metadata available", name)
 }
 
 func (i *ReleaseImage) Version() string {
@@ -73,6 +100,21 @@ func (i *ReleaseImage) ComponentImages() map[string]string {
 		images[tag.Name] = tag.From.Name
 	}
 	return images
+}
+
+// CanonicalComponentImages returns the component images before any registry
+// overrides were applied. If no canonical images were captured (e.g. no
+// registry overrides are configured), it falls back to ComponentImages().
+func (i *ReleaseImage) CanonicalComponentImages() map[string]string {
+	if i.canonicalComponentImages != nil {
+		return i.canonicalComponentImages
+	}
+	return i.ComponentImages()
+}
+
+// SetCanonicalComponentImages stores the pre-override component images.
+func (i *ReleaseImage) SetCanonicalComponentImages(images map[string]string) {
+	i.canonicalComponentImages = images
 }
 
 func (i *ReleaseImage) ComponentVersions() (map[string]string, error) {
@@ -106,8 +148,8 @@ const (
 
 func readComponentVersions(is *imageapi.ImageStream) (ComponentVersions, []error) {
 	var errs []error
-	combined := make(map[string]sets.String)
-	combinedDisplayNames := make(map[string]sets.String)
+	combined := make(map[string]sets.Set[string])
+	combinedDisplayNames := make(map[string]sets.Set[string])
 	for _, tag := range is.Spec.Tags {
 		versions, ok := tag.Annotations[annotationBuildVersions]
 		if !ok {
@@ -115,19 +157,24 @@ func readComponentVersions(is *imageapi.ImageStream) (ComponentVersions, []error
 		}
 		all, err := parseComponentVersionsLabel(versions, tag.Annotations[annotationBuildVersionsDisplayNames])
 		if err != nil {
-			errs = append(errs, fmt.Errorf("the referenced image %s had an invalid version annotation: %v", tag.Name, err))
+			errs = append(errs, fmt.Errorf("the referenced image %s had an invalid version annotation: %w", tag.Name, err))
 		}
 		for k, v := range all {
+			if k == "kubectl" {
+				if tag.Name != "cli" && tag.Name != "cli-artifacts" {
+					continue
+				}
+			}
 			existing, ok := combined[k]
 			if !ok {
-				existing = sets.NewString()
+				existing = sets.New[string]()
 				combined[k] = existing
 			}
 			existing.Insert(v.Version)
 
 			existingDisplayName, ok := combinedDisplayNames[k]
 			if !ok {
-				existingDisplayName = sets.NewString()
+				existingDisplayName = sets.New[string]()
 				combinedDisplayNames[k] = existingDisplayName
 			}
 			existingDisplayName.Insert(v.DisplayName)
@@ -143,13 +190,16 @@ func readComponentVersions(is *imageapi.ImageStream) (ComponentVersions, []error
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := combined[k]
-		if v.Len() > 1 {
+		// we allow multiple machine-os versions due to dual stream efforts
+		if v.Len() > 1 && k != "machine-os" {
 			multiples = multiples.Insert(k)
 		}
 		if _, ok := out[k]; ok {
 			continue
 		}
-		version := v.List()[0]
+		sortedList := v.UnsortedList()
+		sort.Strings(sortedList)
+		version := sortedList[0]
 		if out == nil {
 			out = make(ComponentVersions)
 		}
@@ -160,7 +210,8 @@ func readComponentVersions(is *imageapi.ImageStream) (ComponentVersions, []error
 		if !ok {
 			continue
 		}
-		if v.Len() > 1 {
+		// we allow multiple machine-os versions due to dual stream efforts
+		if v.Len() > 1 && k != "machine-os" {
 			multiples = multiples.Insert(k)
 		}
 		version, ok := out[k]
@@ -168,7 +219,9 @@ func readComponentVersions(is *imageapi.ImageStream) (ComponentVersions, []error
 			continue
 		}
 		if len(version.DisplayName) == 0 {
-			version.DisplayName = v.List()[0]
+			sortedList := v.UnsortedList()
+			sort.Strings(sortedList)
+			version.DisplayName = sortedList[0]
 		}
 		out[k] = version
 	}
@@ -200,7 +253,7 @@ func parseComponentVersionsLabel(label, displayNames string) (ComponentVersions,
 				return nil, fmt.Errorf("the version name %q must only be ASCII alphanumerics and internal hyphens", parts[0])
 			}
 			if !reAllowedDisplayNameKey.MatchString(parts[1]) {
-				return nil, fmt.Errorf("the display name %q must only be alphanumerics, spaces, and symbols in [():-]", parts[1])
+				return nil, fmt.Errorf("the display name %q must only be alphanumerics, spaces, and symbols in [().:-]", parts[1])
 			}
 			names[parts[0]] = parts[1]
 		}
@@ -224,7 +277,7 @@ func parseComponentVersionsLabel(label, displayNames string) (ComponentVersions,
 		}
 		v, err := semver.Parse(parts[1])
 		if err != nil {
-			return nil, fmt.Errorf("the version pair %q must have a valid semantic version: %v", pair, err)
+			return nil, fmt.Errorf("the version pair %q must have a valid semantic version: %w", pair, err)
 		}
 		v.Build = nil
 		labels[parts[0]] = ComponentVersion{
@@ -239,7 +292,7 @@ var (
 	// reAllowedVersionKey limits the allowed component name to a strict subset
 	reAllowedVersionKey = regexp.MustCompile(`^[a-z0-9]+[\-a-z0-9]*[a-z0-9]+$`)
 	// reAllowedDisplayNameKey limits the allowed component name to a strict subset
-	reAllowedDisplayNameKey = regexp.MustCompile(`^[a-zA-Z0-9\-\:\s\(\)]+$`)
+	reAllowedDisplayNameKey = regexp.MustCompile(`^[a-zA-Z0-9\-\:\.\s\(\)]+$`)
 )
 
 // ComponentVersion includes the version and optional display name.
@@ -258,7 +311,7 @@ func (v ComponentVersion) String() string {
 // labels removed, but prerelease segments are preserved.
 type ComponentVersions map[string]ComponentVersion
 
-// OrderedKeys returns the keys in this map in lexigraphic order.
+// OrderedKeys returns the keys in this map in lexicographic order.
 func (v ComponentVersions) OrderedKeys() []string {
 	keys := make([]string, 0, len(v))
 	for k := range v {

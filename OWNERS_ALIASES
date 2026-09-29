@@ -1,0 +1,99 @@
+aliases:
+  api-approvers:
+    - enxebre
+    - csrwng
+    - joelspeed
+    - everettraven
+  tech-leads:
+    - enxebre
+    - csrwng
+  e2e-approvers:
+    - ironcladlou
+  core-approvers:
+    - enxebre
+    - csrwng
+    - muraee
+    - bryan-cox
+    - cblecker
+    - jparrill
+    - devguyio
+    - clebs
+    - sdminonne
+  core-reviewers:
+    - enxebre
+    - csrwng
+    - muraee
+    - bryan-cox
+    - cblecker
+    - jparrill
+    - devguyio
+    - sdminonne
+    - clebs
+    - Nirshal
+    - ironcladlou
+    - georgelipceanu
+    - MehaBhalodiya
+    - dhgautam99
+    - vsolanki12
+    - PoornimaSingour
+    - vismishr
+    - rutvik23
+  karpenter-approvers:
+    - elmiko
+    - enxebre
+    - jkyros
+    - joelsmith
+    - maxcao13
+    - muraee
+  karpenter-reviewers:
+    - elmiko
+    - enxebre
+    - jkyros
+    - joelsmith
+    - maxcao13
+    - muraee
+  konflux-approvers:
+    - celebdor
+  kubevirt-approvers:
+    - nunnatsa
+    - orenc1
+    - awels
+    - akalenyu
+    - qinqon
+  kubevirt-reviewers:
+    - nunnatsa
+    - orenc1
+    - awels
+    - akalenyu
+    - qinqon
+  ibm-reviewers:
+    - hasueki
+    - mihivagyok
+    - pamelachristie
+    - rtheis
+    - ryan-cradick
+    - twodcube
+  gcp-reviewers:
+    - acwalczyk
+    - apahim
+    - cblecker
+    - ckandag
+    - cristianoveiga
+    - daniel-rejniak
+    - floresroger
+    - gbarabasz
+    - jimdaga
+    - patjlm
+    - pvasant
+  powervs-reviewers:
+    - alishaIBM
+    - bkhadars
+    - mkumatag
+    - prb112
+  openstack-approvers:
+    - mandre
+    - stephenfin
+  openstack-reviewers:
+    - gryf
+    - mandre
+    - stephenfin

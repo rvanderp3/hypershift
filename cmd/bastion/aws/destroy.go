@@ -3,20 +3,21 @@ package aws
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/spf13/cobra"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
+	"github.com/openshift/hypershift/cmd/log"
+	"github.com/openshift/hypershift/cmd/util"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
-	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
-	"github.com/openshift/hypershift/cmd/util"
+	"github.com/go-logr/logr"
+	"github.com/spf13/cobra"
 )
 
 type DestroyBastionOpts struct {
@@ -25,6 +26,8 @@ type DestroyBastionOpts struct {
 	InfraID            string
 	Region             string
 	AWSCredentialsFile string
+	AWSKey             string
+	AWSSecretKey       string
 }
 
 func NewDestroyCommand() *cobra.Command {
@@ -43,29 +46,23 @@ func NewDestroyCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.Region, "region", opts.Region, "The region to use for creating the bastion")
 	cmd.Flags().StringVar(&opts.AWSCredentialsFile, "aws-creds", opts.AWSCredentialsFile, "File with AWS credentials")
 
-	cmd.MarkFlagRequired("aws-creds")
-	cmd.MarkFlagFilename("aws-creds")
+	_ = cmd.MarkFlagRequired("aws-creds")
+	_ = cmd.MarkFlagFilename("aws-creds")
 
-	cmd.Run = func(cmd *cobra.Command, args []string) {
+	logger := log.Log
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if err := opts.Validate(); err != nil {
-			log.Error(err, "Invalid arguments")
-			cmd.Usage()
-			return
+			logger.Error(err, "Invalid arguments")
+			_ = cmd.Usage()
+			return nil
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT)
-		go func() {
-			<-sigs
-			cancel()
-		}()
-
-		if err := opts.Run(ctx); err != nil {
-			log.Error(err, "Failed to create bastion")
-			os.Exit(1)
+		if err := opts.Run(cmd.Context(), logger); err != nil {
+			logger.Error(err, "Failed to create bastion")
+			return err
 		} else {
-			log.Info("Successfully destroyed bastion")
+			logger.Info("Successfully destroyed bastion")
 		}
+		return nil
 	}
 
 	return cmd
@@ -87,13 +84,16 @@ func (o *DestroyBastionOpts) Validate() error {
 	return nil
 }
 
-func (o *DestroyBastionOpts) Run(ctx context.Context) error {
+func (o *DestroyBastionOpts) Run(ctx context.Context, logger logr.Logger) error {
 
 	var infraID, region string
 
 	if len(o.Name) > 0 {
 		// Find HostedCluster and get AWS creds
-		c := util.GetClientOrDie()
+		c, err := util.GetClient()
+		if err != nil {
+			return err
+		}
 
 		var hostedCluster hyperv1.HostedCluster
 		if err := c.Get(ctx, types.NamespacedName{Namespace: o.Namespace, Name: o.Name}, &hostedCluster); err != nil {
@@ -105,43 +105,45 @@ func (o *DestroyBastionOpts) Run(ctx context.Context) error {
 
 		infraID = hostedCluster.Spec.InfraID
 		region = hostedCluster.Spec.Platform.AWS.Region
-		log.Info("Found hosted cluster", "namespace", hostedCluster.Namespace, "name", hostedCluster.Name, "infraID", infraID, "region", region)
+		logger.Info("Found hosted cluster", "namespace", hostedCluster.Namespace, "name", hostedCluster.Name, "infraID", infraID, "region", region)
 	} else {
 		infraID = o.InfraID
 		region = o.Region
 	}
 
-	awsSession := awsutil.NewSession("cli-destroy-bastion")
-	awsConfig := awsutil.NewConfig(o.AWSCredentialsFile, region)
-	ec2Client := ec2.New(awsSession, awsConfig)
+	awsSession := awsutil.NewSession(ctx, "cli-destroy-bastion", o.AWSCredentialsFile, o.AWSKey, o.AWSSecretKey, region)
+	awsConfig := awsutil.NewConfig()
+	ec2Client := ec2.NewFromConfig(*awsSession, func(o *ec2.Options) {
+		o.Retryer = awsConfig()
+	})
 
-	return wait.PollImmediateUntil(5*time.Second, func() (bool, error) {
-		err := destroyBastion(ctx, ec2Client, infraID)
+	return wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := destroyBastion(ctx, logger, ec2Client, infraID)
 		if err != nil {
 			if !awsutil.IsErrorRetryable(err) {
 				return false, err
 			}
-			log.Info("WARNING: error during destroy, will retry", "error", err.Error(), "type", fmt.Sprintf("%T,%+v", err, err))
+			logger.Info("WARNING: error during destroy, will retry", "error", err.Error(), "type", fmt.Sprintf("%T,%+v", err, err))
 			return false, nil
 		}
 		return true, nil
-	}, ctx.Done())
+	})
 }
 
-func destroyBastion(ctx context.Context, ec2Client *ec2.EC2, infraID string) error {
-	if err := destroyEC2Instance(ctx, ec2Client, infraID); err != nil {
+func destroyBastion(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, infraID string) error {
+	if err := destroyEC2Instance(ctx, logger, ec2Client, infraID); err != nil {
 		return err
 	}
-	if err := destroySecurityGroup(ctx, ec2Client, infraID); err != nil {
+	if err := destroySecurityGroup(ctx, logger, ec2Client, infraID); err != nil {
 		return err
 	}
-	if err := destroyKeyPair(ctx, ec2Client, infraID); err != nil {
+	if err := destroyKeyPair(ctx, logger, ec2Client, infraID); err != nil {
 		return err
 	}
 	return nil
 }
 
-func destroyEC2Instance(ctx context.Context, ec2Client *ec2.EC2, infraID string) error {
+func destroyEC2Instance(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, infraID string) error {
 	instanceID, err := existingInstance(ctx, ec2Client, infraID)
 	if err != nil {
 		return err
@@ -151,17 +153,17 @@ func destroyEC2Instance(ctx context.Context, ec2Client *ec2.EC2, infraID string)
 	}
 	terminateCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	_, err = ec2Client.TerminateInstancesWithContext(terminateCtx, &ec2.TerminateInstancesInput{
-		InstanceIds: []*string{aws.String(instanceID)},
+	_, err = ec2Client.TerminateInstances(terminateCtx, &ec2.TerminateInstancesInput{
+		InstanceIds: []string{instanceID},
 	})
 	if err != nil {
 		return fmt.Errorf("error deleting instance: %w", err)
 	}
-	log.Info("Deleted bastion instance", "id", instanceID, "name", instanceName(infraID))
+	logger.Info("Deleted bastion instance", "id", instanceID, "name", instanceName(infraID))
 	return nil
 }
 
-func destroySecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID string) error {
+func destroySecurityGroup(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, infraID string) error {
 	sg, err := existingSecurityGroup(ctx, ec2Client, infraID)
 	if err != nil {
 		return err
@@ -171,17 +173,17 @@ func destroySecurityGroup(ctx context.Context, ec2Client *ec2.EC2, infraID strin
 	}
 	sgCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	_, err = ec2Client.DeleteSecurityGroupWithContext(sgCtx, &ec2.DeleteSecurityGroupInput{
+	_, err = ec2Client.DeleteSecurityGroup(sgCtx, &ec2.DeleteSecurityGroupInput{
 		GroupId: sg.GroupId,
 	})
 	if err != nil {
 		return fmt.Errorf("error deleting security group: %w", err)
 	}
-	log.Info("Deleted security group", "id", aws.StringValue(sg.GroupId), "name", securityGroupName(infraID))
+	logger.Info("Deleted security group", "id", aws.ToString(sg.GroupId), "name", securityGroupName(infraID))
 	return nil
 }
 
-func destroyKeyPair(ctx context.Context, ec2Client *ec2.EC2, infraID string) error {
+func destroyKeyPair(ctx context.Context, logger logr.Logger, ec2Client *ec2.Client, infraID string) error {
 	keyPairID, err := existingKeyPair(ctx, ec2Client, infraID)
 	if err != nil {
 		return err
@@ -191,12 +193,12 @@ func destroyKeyPair(ctx context.Context, ec2Client *ec2.EC2, infraID string) err
 	}
 	kpCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	_, err = ec2Client.DeleteKeyPairWithContext(kpCtx, &ec2.DeleteKeyPairInput{
+	_, err = ec2Client.DeleteKeyPair(kpCtx, &ec2.DeleteKeyPairInput{
 		KeyPairId: aws.String(keyPairID),
 	})
 	if err != nil {
 		return fmt.Errorf("error deleting keypair: %w", err)
 	}
-	log.Info("Deleted keypair", "id", keyPairID, "name", keyPairName(infraID))
+	logger.Info("Deleted keypair", "id", keyPairID, "name", keyPairName(infraID))
 	return nil
 }

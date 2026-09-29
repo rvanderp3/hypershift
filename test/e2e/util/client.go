@@ -2,29 +2,47 @@ package util
 
 import (
 	"fmt"
-	"os"
+	"time"
 
 	"k8s.io/client-go/rest"
+
 	cr "sigs.k8s.io/controller-runtime"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
-
-	hyperapi "github.com/openshift/hypershift/api"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// GetConfigOrDie creates a REST config from current context
-func GetConfigOrDie() *rest.Config {
-	cfg := cr.GetConfigOrDie()
-	cfg.QPS = 100
-	cfg.Burst = 100
-	return cfg
+// GetConfig creates a REST config from current context
+func GetConfig() (*rest.Config, error) {
+	cfg, err := cr.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	// Disable client-side rate limiting (QPS=-1) for e2e tests. The API server's
+	// Priority and Fairness provides server-side flow control. Client-side rate
+	// limiting produced misleading "client rate limiter Wait returned an error"
+	// messages when test contexts expired.
+	cfg.QPS = -1
+	cfg.Burst = -1
+	cfg.Timeout = 5 * time.Minute
+	return cfg, nil
 }
 
-// GetClientOrDie creates a controller-runtime client for Kubernetes
-func GetClientOrDie() crclient.Client {
-	client, err := crclient.New(GetConfigOrDie(), crclient.Options{Scheme: hyperapi.Scheme})
+// GetClient creates a controller-runtime client for Kubernetes
+func GetClient() (crclient.Client, error) {
+	config, err := GetConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to get kubernetes client: %v", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("unable to get kubernetes config: %w", err)
 	}
-	return client
+	client, err := crclient.New(config, crclient.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes client: %w", err)
+	}
+	return client, nil
+}
+
+func GetFakeClient(objects ...crclient.Object) crclient.Client {
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).
+		Build()
 }

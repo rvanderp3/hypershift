@@ -3,7 +3,23 @@ package controllers
 import (
 	"sync"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+var (
+	PayloadCacheSizeTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ign_server_payload_cache_total",
+	})
+)
+
+func init() {
+	metrics.Registry.MustRegister(
+		PayloadCacheSizeTotal,
+	)
+}
 
 // ExpiringCache enables a cache of pairs "token: payload".
 // Any pair in the cache is expired once entry.expiry time is above the cache ttl.
@@ -15,42 +31,59 @@ type ExpiringCache struct {
 	sync.RWMutex
 }
 
+type CacheValue struct {
+	Payload         []byte
+	SecretName      string
+	CloudConfigHash string
+}
+
 type entry struct {
-	value  []byte
+	value  CacheValue
 	expiry time.Time
 }
 
-func (c *ExpiringCache) Get(key string) (value []byte, ok bool) {
+func (c *ExpiringCache) Get(key string) (value CacheValue, ok bool) {
+	c.garbageCollect()
+
 	c.RLock()
 	defer c.RUnlock()
 
-	c.garbageCollect()
-
 	result, ok := c.cache[key]
 	if !ok {
-		return nil, false
+		return CacheValue{}, false
 	}
 
-	// Renew expiring time everytime time we Get.
-	result.expiry = time.Now().Add(c.ttl)
 	return result.value, ok
 }
 
-func (c *ExpiringCache) Set(key string, value []byte) {
+func (c *ExpiringCache) Set(key string, value CacheValue) {
 	c.Lock()
 	defer c.Unlock()
 
-	// Renew expiring time everytime time we Set.
+	// Renew expiring time every time we Set.
 	c.cache[key] = &entry{
 		value:  value,
 		expiry: time.Now().Add(c.ttl),
 	}
+	PayloadCacheSizeTotal.Inc()
 }
 
 func (c *ExpiringCache) Delete(key string) {
 	c.Lock()
 	defer c.Unlock()
 	delete(c.cache, key)
+	PayloadCacheSizeTotal.Dec()
+}
+
+func (c *ExpiringCache) Keys() []string {
+	c.RLock()
+	defer c.RUnlock()
+
+	var keys []string
+	for k := range c.cache {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func (c *ExpiringCache) garbageCollect() {

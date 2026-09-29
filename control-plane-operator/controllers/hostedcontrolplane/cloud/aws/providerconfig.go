@@ -1,29 +1,22 @@
 package aws
 
 import (
-	"fmt"
+	"github.com/openshift/hypershift/support/podspec"
 
 	corev1 "k8s.io/api/core/v1"
-
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/util"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
-	Provider          = "aws"
+	Provider          = podspec.AWSCloudProviderName
 	ProviderConfigKey = "aws.conf"
 )
 
-const configTemplate = `[Global]
-Zone = %s
-VPC = %s
-KubernetesClusterID = %s
-SubnetID = %s`
-
-func (p *AWSParams) ReconcileCloudConfig(cm *corev1.ConfigMap) error {
-	util.EnsureOwnerRef(cm, p.OwnerRef)
-	if cm.Data == nil {
-		cm.Data = map[string]string{}
+func AWSKMSCredsSecret(controlPlaneNamespace string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: controlPlaneNamespace,
+			Name:      "kms-creds",
+		},
 	}
-	cm.Data[ProviderConfigKey] = fmt.Sprintf(configTemplate, p.Zone, p.VPC, p.ClusterID, p.SubnetID)
-	return nil
 }

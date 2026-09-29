@@ -1,29 +1,30 @@
 package oapi
 
 import (
-	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/support/config"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/config"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/util"
 )
 
 const (
-	OpenShiftAPIServerPort      = 8443
-	OpenShiftOAuthAPIServerPort = 8443
-	OpenShiftServicePort        = 443
-	OLMPackageServerPort        = 5443
+	OpenShiftAPIServerPort = 8443
+	OpenShiftServicePort   = 443
+	OLMPackageServerPort   = 5443
 )
 
 var (
-	openshiftAPIServerLabels = map[string]string{"app": "openshift-apiserver", hyperv1.ControlPlaneComponent: "openshift-apiserver"}
-	oauthAPIServerLabels     = map[string]string{"app": "openshift-oauth-apiserver", hyperv1.ControlPlaneComponent: "openshift-oauth-apiserver"}
-	olmPackageServerLabels   = map[string]string{"app": "packageserver", hyperv1.ControlPlaneComponent: "packageserver"}
+	oauthAPIServerLabels   = map[string]string{"app": "openshift-oauth-apiserver", hyperv1.ControlPlaneComponentLabel: "openshift-oauth-apiserver"}
+	olmPackageServerLabels = map[string]string{"app": "packageserver", hyperv1.ControlPlaneComponentLabel: "packageserver"}
 )
 
+func openshiftAPIServerLabels() map[string]string {
+	return map[string]string{"app": "openshift-apiserver", hyperv1.ControlPlaneComponentLabel: "openshift-apiserver"}
+}
+
 func ReconcileOpenShiftAPIService(svc *corev1.Service, ownerRef config.OwnerRef) error {
-	return reconcileAPIService(svc, ownerRef, openshiftAPIServerLabels, OpenShiftAPIServerPort)
+	return reconcileAPIService(svc, ownerRef, openshiftAPIServerLabels(), OpenShiftAPIServerPort)
 }
 
 func ReconcileOAuthAPIService(svc *corev1.Service, ownerRef config.OwnerRef) error {
@@ -36,7 +37,10 @@ func ReconcileOLMPackageServerService(svc *corev1.Service, ownerRef config.Owner
 
 func reconcileAPIService(svc *corev1.Service, ownerRef config.OwnerRef, labels map[string]string, targetPort int) error {
 	ownerRef.ApplyTo(svc)
-	svc.Spec.Selector = labels
+	svc.Labels = openshiftAPIServerLabels()
+	if svc.Spec.Selector == nil {
+		svc.Spec.Selector = labels
+	}
 	var portSpec corev1.ServicePort
 	if len(svc.Spec.Ports) > 0 {
 		portSpec = svc.Spec.Ports[0]
@@ -49,25 +53,5 @@ func reconcileAPIService(svc *corev1.Service, ownerRef config.OwnerRef, labels m
 	portSpec.TargetPort = intstr.FromInt(targetPort)
 	svc.Spec.Type = corev1.ServiceTypeClusterIP
 	svc.Spec.Ports[0] = portSpec
-	return nil
-}
-
-func ReconcileWorkerService(cm *corev1.ConfigMap, ownerRef config.OwnerRef, svc *corev1.Service) error {
-	ownerRef.ApplyTo(cm)
-	if err := reconcileClusterService(svc); err != nil {
-		return err
-	}
-	ownerRef.ApplyTo(cm)
-	util.ReconcileWorkerManifest(cm, svc)
-	return nil
-}
-
-func reconcileClusterService(svc *corev1.Service) error {
-	svc.Spec.Ports = []corev1.ServicePort{
-		{
-			Name: "https",
-			Port: OpenShiftServicePort,
-		},
-	}
 	return nil
 }

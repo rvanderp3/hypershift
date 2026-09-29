@@ -15,12 +15,12 @@
 package ini
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Key represents a key under a section.
@@ -110,15 +110,24 @@ func (k *Key) Value() string {
 	return k.value
 }
 
-// ValueWithShadows returns raw values of key and its shadows if any.
+// ValueWithShadows returns raw values of key and its shadows if any. Shadow
+// keys with empty values are ignored from the returned list.
 func (k *Key) ValueWithShadows() []string {
 	if len(k.shadows) == 0 {
+		if k.value == "" {
+			return []string{}
+		}
 		return []string{k.value}
 	}
-	vals := make([]string, len(k.shadows)+1)
-	vals[0] = k.value
-	for i := range k.shadows {
-		vals[i+1] = k.shadows[i].value
+
+	vals := make([]string, 0, len(k.shadows)+1)
+	if k.value != "" {
+		vals = append(vals, k.value)
+	}
+	for _, s := range k.shadows {
+		if s.value != "" {
+			vals = append(vals, s.value)
+		}
 	}
 	return vals
 }
@@ -161,7 +170,7 @@ func (k *Key) transformValue(val string) string {
 		}
 
 		// Substitute by new value and take off leading '%(' and trailing ')s'.
-		val = strings.Replace(val, vr, nk.value, -1)
+		val = strings.ReplaceAll(val, vr, nk.String())
 	}
 	return val
 }
@@ -420,7 +429,7 @@ func (k *Key) InUint64(defaultVal uint64, candidates []uint64) uint64 {
 func (k *Key) InTimeFormat(format string, defaultVal time.Time, candidates []time.Time) time.Time {
 	val := k.MustTimeFormat(format)
 	for _, cand := range candidates {
-		if val == cand {
+		if val.Equal(cand) {
 			return val
 		}
 	}
@@ -486,31 +495,38 @@ func (k *Key) Strings(delim string) []string {
 		return []string{}
 	}
 
-	runes := []rune(str)
-	vals := make([]string, 0, 2)
-	var buf bytes.Buffer
-	escape := false
-	idx := 0
+	maxParts := strings.Count(str, delim) + 1
+	vals := make([]string, 0, maxParts)
+
+	var buf strings.Builder
+	buf.Grow(len(str))
+
+	i := 0
 	for {
-		if escape {
-			escape = false
-			if runes[idx] != '\\' && !strings.HasPrefix(string(runes[idx:]), delim) {
+		if str[i] == '\\' {
+			i++
+			if i >= len(str) {
+				break
+			}
+
+			if str[i] != '\\' && !strings.HasPrefix(str[i:], delim) {
 				buf.WriteRune('\\')
 			}
-			buf.WriteRune(runes[idx])
+
+			r, size := utf8.DecodeRuneInString(str[i:])
+			i += size
+			buf.WriteRune(r)
+		} else if strings.HasPrefix(str[i:], delim) {
+			i += len(delim)
+			vals = append(vals, strings.TrimSpace(buf.String()))
+			buf.Reset()
 		} else {
-			if runes[idx] == '\\' {
-				escape = true
-			} else if strings.HasPrefix(string(runes[idx:]), delim) {
-				idx += len(delim) - 1
-				vals = append(vals, strings.TrimSpace(buf.String()))
-				buf.Reset()
-			} else {
-				buf.WriteRune(runes[idx])
-			}
+			r, size := utf8.DecodeRuneInString(str[i:])
+			i += size
+			buf.WriteRune(r)
 		}
-		idx++
-		if idx == len(runes) {
+
+		if i >= len(str) {
 			break
 		}
 	}

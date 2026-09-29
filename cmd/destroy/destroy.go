@@ -1,24 +1,24 @@
-package create
+package destroy
 
 import (
-	"github.com/spf13/cobra"
-
 	"github.com/openshift/hypershift/cmd/bastion"
 	"github.com/openshift/hypershift/cmd/cluster"
 	"github.com/openshift/hypershift/cmd/infra"
+
+	"github.com/spf13/cobra"
 )
 
 func NewCommand() *cobra.Command {
-	cmd := &cobra.Command{
+	destroyCmd := &cobra.Command{
 		Use:          "destroy",
 		Short:        "Commands for destroying HyperShift resources",
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(infra.NewDestroyCommand())
-	cmd.AddCommand(infra.NewDestroyIAMCommand())
-	cmd.AddCommand(cluster.NewDestroyCommand())
-	cmd.AddCommand(bastion.NewDestroyCommand())
+	destroyCmd.AddCommand(cluster.NewDestroyCommands())
+	destroyCmd.AddCommand(infra.NewDestroyCommand())
+	destroyCmd.AddCommand(infra.NewDestroyIAMCommand())
+	destroyCmd.AddCommand(bastion.NewDestroyCommand())
 
-	return cmd
+	return destroyCmd
 }

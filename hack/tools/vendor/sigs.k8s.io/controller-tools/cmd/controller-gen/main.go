@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,13 +17,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
-
 	"sigs.k8s.io/controller-tools/pkg/crd"
 	"sigs.k8s.io/controller-tools/pkg/deepcopy"
 	"sigs.k8s.io/controller-tools/pkg/genall"
@@ -198,7 +198,8 @@ func main() {
 	})
 
 	if err := cmd.Execute(); err != nil {
-		if _, noUsage := err.(noUsageError); !noUsage {
+		var errNoUsage noUsageError
+		if !errors.As(err, &errNoUsage) {
 			// print the usage unless we suppressed it
 			if err := cmd.Usage(); err != nil {
 				panic(err)

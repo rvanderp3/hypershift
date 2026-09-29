@@ -1,0 +1,1201 @@
+//go:build e2ev2
+
+/*
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package tests
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/support/podspec"
+	"github.com/openshift/hypershift/support/upsert"
+	e2eutil "github.com/openshift/hypershift/test/e2e/util"
+	"github.com/openshift/hypershift/test/e2e/v2/internal"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
+
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var (
+	workloads             = internal.GetControlPlaneWorkloads()
+	desiredStateHashHexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+// podCrashTolerations defines the tolerated amount of restarts a pod is allowed
+// to suffer until it is considered to be crashing. Pods whose component
+// matches a key are evaluated with the associated toleration. If a pod is not
+// listed, the default toleration is used.
+var podCrashTolerations = map[string]int32{
+	// TODO: Figure out why Route kind does not exist when ingress-operator first starts
+	"ingress-operator": 20,
+	// Seeing flakes due to https://issues.redhat.com/browse/OCPBUGS-30068
+	"cloud-credential-operator": 20,
+	// Restart built into OLM by design by https://github.com/openshift/operator-framework-olm/commit/1cf358424a0cbe353428eab9a16051c6cabbd002
+	"olm-operator":                20,
+	"catalog-operator":            20,
+	"certified-operators-catalog": 20,
+	"community-operators-catalog": 20,
+	"redhat-operators-catalog":    20,
+	"redhat-marketplace-catalog":  20,
+	// Temporary workaround for https://issues.redhat.com/browse/OCPBUGS-45182
+	"openstack-manila-csi-controllerplugin": 20,
+	// Temporary workaround for https://issues.redhat.com/browse/CNV-40820
+	"kubevirt-csi":                  20,
+	"aws-ebs-csi-driver-controller": 1,
+	// Allow 1 restart for network-node-identity webhook startup timing
+	"network-node-identity": 1,
+	// Temporary workaround for https://issues.redhat.com/browse/CNV-76520
+	"kubevirt-cloud-controller-manager": 2,
+	// Allow 1 restart for token-minter sidecar race condition: https://issues.redhat.com/browse/GCP-441
+	// TODO(GCP-447): Remove this toleration once token-minter is injected as a native sidecar init container.
+	"gcp-cloud-controller-manager": 1,
+	// During minor version upgrades the controlplane-manager rolls out the new
+	// dns-operator before CVO applies the updated ClusterRole on the hosted
+	// cluster. The 4.22 dns-operator requires NetworkPolicy and APIServer RBAC
+	// that does not exist in 4.21, so it crash-loops until CVO catches up. This
+	// is a deterministic ordering issue, not a race.
+	// See https://issues.redhat.com/browse/OCPBUGS-78539
+	"dns-operator": 5,
+	// CVO and CNO may restart once during hosted cluster initialization due to
+	// dependency ordering and hosted kube-apiserver availability timing.
+	// See https://issues.redhat.com/browse/OCPBUGS-109581
+	// See https://issues.redhat.com/browse/OCPBUGS-77042
+	// See https://issues.redhat.com/browse/OCPBUGS-18569
+	"cluster-version-operator": 1,
+	"cluster-network-operator": 1,
+}
+
+func defaultCrashTolerationForCluster(hostedCluster *hyperv1.HostedCluster) int32 {
+	defaultCrashToleration := int32(0)
+	if hostedCluster.Spec.Platform.Type == hyperv1.KubevirtPlatform {
+		kvPlatform := hostedCluster.Spec.Platform.Kubevirt
+		// External infra can be slow at times due to the nested nature of how
+		// external infra is tested within a kubevirt HCP running within baremetal
+		// OCP. Occasionally pods will fail with "Error: context deadline exceeded"
+		// reported by the kubelet. This seems to be an infra issue with etcd
+		// latency within the external infra test environment. Tolerating a single
+		// restart for random components helps.
+		//
+		// This toleration is not used for the default local HCP KubeVirt, only
+		// external infra.
+		if kvPlatform != nil && kvPlatform.Credentials != nil {
+			defaultCrashToleration = 1
+		}
+		// In Azure infra, the CAPK pod might crash on startup because it cannot
+		// get a leader election lock lease during the early stages due to a
+		// "context deadline exceeded" error.
+		if kvPlatform != nil && hostedCluster.Annotations != nil {
+			if hostedCluster.Annotations[hyperv1.ManagementPlatformAnnotation] == string(hyperv1.AzurePlatform) {
+				defaultCrashToleration = 1
+			}
+		}
+	}
+	return defaultCrashToleration
+}
+
+func crashTolerationForComponent(componentName string, defaultCrashToleration int32) int32 {
+	crashToleration := defaultCrashToleration
+	if toleration, ok := podCrashTolerations[componentName]; ok {
+		crashToleration = toleration
+	}
+	return crashToleration
+}
+
+// isCertificateTriggeredRestart checks if a kube-controller-manager restart
+// was triggered by certificate rotation.
+func isCertificateTriggeredRestart(ctx context.Context, client crclient.Client, pod *corev1.Pod) bool {
+	hcpList := &hyperv1.HostedControlPlaneList{}
+	if err := client.List(ctx, hcpList, crclient.InNamespace(pod.Namespace)); err != nil {
+		fmt.Fprintf(GinkgoWriter, "couldn't list HostedControlPlanes; pod namespace: %s, pod name: %s, error: %v\n", pod.Namespace, pod.Name, err)
+		return false
+	}
+	for _, hcp := range hcpList.Items {
+		if restartAnnotation, ok := hcp.Annotations[hyperv1.RestartDateAnnotation]; ok && strings.HasPrefix(restartAnnotation, "CertHash:") {
+			return true
+		}
+	}
+	return false
+}
+
+var leaderElectionFailurePatterns = []string{
+	"election lost",
+	"failed to renew lease",
+	"stopped leading",
+}
+
+func isLeaderElectionFailure(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, containerName string) bool {
+	req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+		Container: containerName,
+		Previous:  true,
+		TailLines: ptr.To[int64](100),
+	})
+	podLogs, err := req.Stream(ctx)
+	if err != nil {
+		fmt.Fprintf(GinkgoWriter, "couldn't stream pod log; pod namespace: %s, pod name: %s, error: %v\n", pod.Namespace, pod.Name, err)
+		return false
+	}
+	defer podLogs.Close()
+
+	scanner := bufio.NewScanner(podLogs)
+	const (
+		bufSize          = 256 * 1024
+		maxScanTokenSize = 512 * 1024
+	)
+	scanner.Buffer(make([]byte, bufSize), maxScanTokenSize)
+	for scanner.Scan() {
+		line := strings.ToLower(scanner.Text())
+		for _, pattern := range leaderElectionFailurePatterns {
+			if strings.Contains(line, pattern) {
+				return true
+			}
+		}
+	}
+	_, _ = io.Copy(io.Discard, podLogs)
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(GinkgoWriter, "failed to read pod log; pod namespace: %s, pod name: %s, error: %v\n", pod.Namespace, pod.Name, err)
+	}
+	return false
+}
+
+func getWorkloadPods(testCtx *internal.TestContext, workload internal.WorkloadSpec) []corev1.Pod {
+	GinkgoHelper()
+	pods, err := internal.GetWorkloadPodsBySelector(testCtx.Context, testCtx.MgmtClient, testCtx.ControlPlaneNamespace, workload)
+	Expect(err).NotTo(HaveOccurred(), "failed to list pods for workload %s", workload.Name)
+	return pods
+}
+
+// DeploymentGenerationTest registers tests for deployment generation validation
+func DeploymentGenerationTest(getTestCtx internal.TestContextGetter) {
+
+	Context("Deployment generation", func() {
+		BeforeEach(func() {
+			testCtx := getTestCtx()
+			hostedCluster, err := testCtx.GetHostedCluster()
+			Expect(err).NotTo(HaveOccurred())
+			if hostedCluster.CreationTimestamp.IsZero() || time.Since(hostedCluster.CreationTimestamp.Time) > 4*time.Hour {
+				Skip("Deployment generation test is only for recently created hosted clusters")
+			}
+		})
+
+		// EnsureNoRapidDeploymentRollouts
+		const maxAllowedGeneration = 10
+
+		for _, workload := range workloads {
+			if workload.Type != "Deployment" {
+				continue
+			}
+
+			Context(workload.Name, func() {
+				It("should not indicate rapid rollouts", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					deployment := &appsv1.Deployment{}
+					err = testCtx.MgmtClient.Get(testCtx.Context, crclient.ObjectKey{
+						Namespace: testCtx.ControlPlaneNamespace,
+						Name:      workload.Name,
+					}, deployment)
+					if apierrors.IsNotFound(err) {
+						Skip(fmt.Sprintf("Deployment %s not found", workload.Name))
+					}
+					Expect(err).NotTo(HaveOccurred(), "failed to get Deployment %s", workload.Name)
+
+					Expect(deployment.Generation).To(BeNumerically("<=", maxAllowedGeneration),
+						"Deployment %s has generation %d which exceeds max allowed %d",
+						workload.Name, deployment.Generation, maxAllowedGeneration)
+				})
+			})
+		}
+	})
+}
+
+// SafeToEvictAnnotationsTest registers tests for safe-to-evict annotations
+func SafeToEvictAnnotationsTest(getTestCtx internal.TestContextGetter) {
+	Context("Safe-to-evict annotations", func() {
+
+		BeforeEach(func() {
+			getTestCtx().SkipIfVersionBelow(e2eutil.Version420)
+		})
+
+		// TODO: Fix these in their corresponding repositories
+		exemptions := []string{
+			// Storage workloads
+			"aws-ebs-csi-driver-operator",
+			"azure-disk-csi-driver-operator",
+			"azure-disk-csi-driver-controller",
+			"azure-file-csi-driver-operator",
+			"azure-file-csi-driver-controller",
+			"gcp-pd-csi-driver-controller",
+			"gcp-pd-csi-driver-operator",
+			"openstack-cinder-csi-driver-operator",
+			"openstack-cinder-csi-driver-controller",
+			"openstack-manila-csi-driver-operator",
+			"openstack-manila-csi-controller",
+
+			// Network workloads
+			"network-node-identity",
+			"ovnkube-control-plane",
+		}
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should exist for pods with emptyDir or hostPath volumes", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					// Skip if workload is in exemption list
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from safe-to-evict annotations check", workload.Name))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						// Check if pod has emptyDir or hostPath volumes
+						hasLocalVolumes := false
+						var localVolumeNames []string
+						for _, volume := range pod.Spec.Volumes {
+							if volume.EmptyDir != nil || volume.HostPath != nil {
+								hasLocalVolumes = true
+								localVolumeNames = append(localVolumeNames, volume.Name)
+							}
+						}
+
+						if hasLocalVolumes {
+							annotationKey := "cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes"
+							annotationValue, exists := pod.Annotations[annotationKey]
+							Expect(exists).To(BeTrue(), "pod %s has local volumes but missing safe-to-evict annotation", pod.Name)
+							Expect(annotationValue).NotTo(BeEmpty(), "pod %s has empty safe-to-evict annotation", pod.Name)
+
+							// Verify all local volumes are listed in annotation
+							annotatedVolumes := strings.Split(annotationValue, ",")
+							for _, volName := range localVolumeNames {
+								found := false
+								for _, annVol := range annotatedVolumes {
+									if strings.TrimSpace(annVol) == volName {
+										found = true
+										break
+									}
+								}
+								Expect(found).To(BeTrue(), "pod %s local volume %s not found in annotation", pod.Name, volName)
+							}
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// ReadOnlyRootFilesystemTest registers tests for read-only root filesystem validation
+func ReadOnlyRootFilesystemTest(getTestCtx internal.TestContextGetter) {
+	Context("Read-only root filesystem", func() {
+		BeforeEach(func() {
+			getTestCtx().SkipIfVersionBelow(e2eutil.Version420)
+		})
+
+		// EnsureReadOnlyRootFilesystem
+		// TODO: Fix these in their corresponding repositories
+		exemptions := []string{
+			// Storage workloads
+			"azure-disk-csi-driver-controller",
+			"azure-disk-csi-driver-operator",
+			"azure-file-csi-driver-controller",
+			"azure-file-csi-driver-operator",
+			"aws-ebs-csi-driver-controller",
+			"aws-ebs-csi-driver-operator",
+			"gcp-pd-csi-driver-controller",
+			"gcp-pd-csi-driver-operator",
+			"openstack-cinder-csi-driver-controller",
+			"openstack-manila-csi-controller",
+			"csi-snapshot-controller",
+			"csi-snapshot-webhook",
+			"shared-resource-csi-driver-operator",
+
+			// Network workloads
+			"multus-admission-controller",
+			"network-node-identity",
+			"ovnkube-control-plane",
+			"cloud-network-config-controller",
+
+			// KubeVirt workloads
+			"vmi-console-debug",
+			"virt-launcher",
+
+			// Other workloads
+			"etcd",
+			"featuregate-generator",
+			"packageserver",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have read-only root filesystem for containers", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					// Skip if workload is in exemption list
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from read-only root filesystem check", workload.Name))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						for _, container := range pod.Spec.Containers {
+							Expect(container.SecurityContext).NotTo(BeNil(),
+								"container %s in pod %s should have security context", container.Name, pod.Name)
+							Expect(container.SecurityContext.ReadOnlyRootFilesystem).NotTo(BeNil(),
+								"container %s in pod %s should have ReadOnlyRootFilesystem set", container.Name, pod.Name)
+							Expect(*container.SecurityContext.ReadOnlyRootFilesystem).To(BeTrue(),
+								"container %s in pod %s should have ReadOnlyRootFilesystem=true", container.Name, pod.Name)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// ReadOnlyRootFilesystemTmpDirMountTest registers tests for read-only root filesystem tmp dir mount validation
+func ReadOnlyRootFilesystemTmpDirMountTest(getTestCtx internal.TestContextGetter) {
+	Context("Read-only root filesystem tmp dir mount", func() {
+		BeforeEach(func() {
+			getTestCtx().SkipIfVersionBelow(e2eutil.Version420)
+		})
+
+		// EnsureReadOnlyRootFilesystemTmpDirMount
+		// TODO: Fix these in their corresponding repositories
+		exemptions := []string{
+			// Storage workloads
+			"azure-disk-csi-driver-controller",
+			"azure-disk-csi-driver-operator",
+			"azure-file-csi-driver-controller",
+			"azure-file-csi-driver-operator",
+			"aws-ebs-csi-driver-controller",
+			"aws-ebs-csi-driver-operator",
+			"gcp-pd-csi-driver-controller",
+			"gcp-pd-csi-driver-operator",
+			"openstack-cinder-csi-driver-controller",
+			"openstack-manila-csi",
+			"csi-snapshot-controller",
+			"csi-snapshot-webhook",
+
+			// Network workloads
+			"multus-admission-controller",
+			"network-node-identity",
+			"ovnkube-control-plane",
+			"cloud-network-config-controller",
+
+			// KubeVirt workloads
+			"vmi-console-debug",
+			"kubevirt.io/virt-launcher",
+
+			// Other workloads
+			"packageserver",
+			"etcd",
+			"featuregate-generator",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have /tmp mounted for containers", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					// Skip if workload is in exemption list
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from tmp dir mount check", workload.Name))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						for _, container := range pod.Spec.Containers {
+							hasTmpMount := false
+							for _, mount := range container.VolumeMounts {
+								if mount.MountPath == podspec.PodTmpDirMountPath {
+									hasTmpMount = true
+									break
+								}
+							}
+							Expect(hasTmpMount).To(BeTrue(),
+								"container %s in pod %s should have /tmp mounted", container.Name, pod.Name)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// ContainerImagePullPolicyTest registers tests for container image pull policy validation
+func ContainerImagePullPolicyTest(getTestCtx internal.TestContextGetter) {
+	Context("Container image pull policy", func() {
+		// EnsureAllContainersHavePullPolicyIfNotPresent
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have IfNotPresent pull policy for containers", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						for _, container := range pod.Spec.Containers {
+							if container.ImagePullPolicy == "" {
+								Fail(fmt.Sprintf("container %s in pod %s has no ImagePullPolicy set", container.Name, pod.Name))
+							}
+							Expect(container.ImagePullPolicy).To(Equal(corev1.PullIfNotPresent),
+								"container %s in pod %s should have ImagePullPolicy=IfNotPresent, got %s",
+								container.Name, pod.Name, container.ImagePullPolicy)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// ContainerTerminationMessagePolicyTest registers tests for container termination message policy validation
+func ContainerTerminationMessagePolicyTest(getTestCtx internal.TestContextGetter) {
+	Context("Container termination message policy", func() {
+		BeforeEach(func() {
+			getTestCtx().SkipIfVersionBelow(e2eutil.Version419)
+		})
+
+		// EnsureAllContainersHaveTerminationMessagePolicyFallbackToLogsOnError
+		// TODO: Fix these in their corresponding repositories
+		exemptions := []string{
+			// Network workloads
+			"cloud-network-config-controller",
+			"network-node-identity",
+			"ovnkube-control-plane",
+
+			// KubeVirt workloads
+			"vmi-console-debug",
+			"virt-launcher",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have FallbackToLogsOnError termination message policy for containers", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					// Skip if workload is in exemption list
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from termination message policy check", workload.Name))
+					}
+
+					// Skip KubeVirt related pods
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						for _, initContainer := range pod.Spec.InitContainers {
+							Expect(initContainer.TerminationMessagePolicy).To(Equal(corev1.TerminationMessageFallbackToLogsOnError),
+								"initContainer %s in pod %s should have TerminationMessagePolicy=FallbackToLogsOnError",
+								initContainer.Name, pod.Name)
+						}
+						for _, container := range pod.Spec.Containers {
+							Expect(container.TerminationMessagePolicy).To(Equal(corev1.TerminationMessageFallbackToLogsOnError),
+								"container %s in pod %s should have TerminationMessagePolicy=FallbackToLogsOnError",
+								container.Name, pod.Name)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// ContainerResourceRequestsTest registers tests for container resource requests validation
+func ContainerResourceRequestsTest(getTestCtx internal.TestContextGetter) {
+	Context("Container resource requests", func() {
+		// EnsureHCPContainersHaveResourceRequests
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have resource requests for containers", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						for _, container := range pod.Spec.Containers {
+							Expect(container.Resources.Requests).NotTo(BeNil(),
+								"container %s in pod %s should have resource requests", container.Name, pod.Name)
+							_, hasCPU := container.Resources.Requests[corev1.ResourceCPU]
+							Expect(hasCPU).To(BeTrue(),
+								"container %s in pod %s should have CPU resource request", container.Name, pod.Name)
+							_, hasMemory := container.Resources.Requests[corev1.ResourceMemory]
+							Expect(hasMemory).To(BeTrue(),
+								"container %s in pod %s should have memory resource request", container.Name, pod.Name)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// PodPriorityTest registers tests for pod priority validation
+func PodPriorityTest(getTestCtx internal.TestContextGetter) {
+	Context("Pod priority", func() {
+		// EnsureNoPodsWithTooHighPriority
+		const maxAllowedPriority = 100002000
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should not have too high priority for pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						if pod.Spec.Priority != nil && *pod.Spec.Priority > maxAllowedPriority {
+							Fail(fmt.Sprintf("pod %s has priority %d which exceeds maximum allowed %d", pod.Name, *pod.Spec.Priority, maxAllowedPriority))
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// ServiceAccountTokenMountingTest registers tests for service account token mounting validation
+func ServiceAccountTokenMountingTest(getTestCtx internal.TestContextGetter) {
+	Context("Service account token mounting", func() {
+		// EnsureSATokenNotMountedUnlessNecessary
+		// Build expected components list based on platform
+		exemptions := []string{
+			"packageserver",
+			"csi-snapshot-controller",
+			"shared-resource-csi-driver-operator",
+			"capi-provider",
+			"cluster-api",
+			"cluster-network-operator",
+			"cluster-autoscaler",
+			"cluster-node-tuning-operator",
+			"cluster-storage-operator",
+			"csi-snapshot-controller-operator",
+			"machine-approver",
+			"etcd",
+			"control-plane-operator",
+			"control-plane-pki-operator",
+			"hosted-cluster-config-operator",
+			"ignition-server",
+			"cloud-controller-manager",
+			"olm-collect-profiles",
+			"karpenter",
+			"karpenter-operator",
+			"featuregate-generator",
+
+			// AWS-specific exemptions
+			"aws-ebs-csi-driver-controller",
+			"aws-ebs-csi-driver-operator",
+
+			// GCP-specific exemptions
+			"gcp-pd-csi-driver-controller",
+			"gcp-pd-csi-driver-operator",
+
+			// Azure-specific exemptions
+			"azure-cloud-controller-manager",
+			"azure-disk-csi-driver-controller",
+			"azure-disk-csi-driver-operator",
+			"azure-file-csi-driver-controller",
+			"azure-file-csi-driver-operator",
+
+			// OpenStack-specific exemptions
+			"openstack-cinder-csi-driver-controller",
+			"openstack-cinder-csi-driver-operator",
+			"openstack-manila-csi-controllerplugin",
+			"manila-csi-driver-operator",
+
+			// Kubevirt-specific exemptions
+			"kubevirt-cloud-controller-manager",
+			"kubevirt-csi-controller",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should not mount service account token unless necessary for pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					testCtx.SkipIfVersionBelow(e2eutil.Version416)
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from service account token mounting check", workload.Name))
+					}
+					if workload.Name == "csi-snapshot-webhook" && !testCtx.VersionAtLeast(e2eutil.Version418) {
+						Skip(fmt.Sprintf("workload %s is exempt from service account token mounting check before %s", workload.Name, e2eutil.Version418))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						for _, volume := range pod.Spec.Volumes {
+							Expect(volume.Name).NotTo(HavePrefix("kube-api-access-"),
+								"pod %s should not have kube-api-access-* volume mounted", pod.Name)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// PodAffinitiesAndTolerationsTest registers tests for pod affinities and tolerations validation
+func PodAffinitiesAndTolerationsTest(getTestCtx internal.TestContextGetter) {
+	Context("Pod affinities and tolerations", func() {
+		// EnsureHCPPodsAffinitiesAndTolerations
+		BeforeEach(func() {
+			getTestCtx().SkipIfNotPlatform(hyperv1.AWSPlatform)
+		})
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have correct affinities and tolerations for pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					// SRO is being removed in 4.18
+					if workload.Name == "shared-resource-csi-driver-operator" {
+						Skip("shared-resource-csi-driver-operator is exempt from affinities and tolerations check")
+					}
+
+					if workload.Name == "virt-launcher" || workload.Name == "vmi-console-debug" {
+						Skip("virt-launcher and vmi-console-debug are exempt from affinities and tolerations check")
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					controlPlaneLabelTolerationKey := "hypershift.openshift.io/control-plane"
+					clusterNodeSchedulingAffinityWeight := 100
+					controlPlaneNodeSchedulingAffinityWeight := clusterNodeSchedulingAffinityWeight / 2
+					colocationLabelKey := "hypershift.openshift.io/hosted-control-plane"
+
+					var expectedTolerations []corev1.Toleration
+					switch workload.Name {
+					case "aws-ebs-csi-driver-operator":
+						expectedTolerations = []corev1.Toleration{
+							{
+								Key:      controlPlaneLabelTolerationKey,
+								Operator: corev1.TolerationOpExists,
+							},
+							{
+								Key:      hyperv1.HostedClusterLabel,
+								Operator: corev1.TolerationOpEqual,
+								Value:    testCtx.ControlPlaneNamespace,
+							},
+						}
+					default:
+						expectedTolerations = []corev1.Toleration{
+							{
+								Key:      controlPlaneLabelTolerationKey,
+								Operator: corev1.TolerationOpEqual,
+								Value:    "true",
+								Effect:   corev1.TaintEffectNoSchedule,
+							},
+							{
+								Key:      hyperv1.HostedClusterLabel,
+								Operator: corev1.TolerationOpEqual,
+								Value:    testCtx.ControlPlaneNamespace,
+								Effect:   corev1.TaintEffectNoSchedule,
+							},
+						}
+					}
+
+					for _, pod := range pods {
+						for _, expectedTol := range expectedTolerations {
+							found := false
+							for _, tol := range pod.Spec.Tolerations {
+								if tol.Key == expectedTol.Key && tol.Operator == expectedTol.Operator && tol.Value == expectedTol.Value && tol.Effect == expectedTol.Effect {
+									found = true
+									break
+								}
+							}
+							Expect(found).To(BeTrue(), "pod %s should have toleration %+v", pod.Name, expectedTol)
+						}
+
+						// Check affinities
+						Expect(pod.Spec.Affinity).NotTo(BeNil(), "pod %s should have affinity", pod.Name)
+						Expect(pod.Spec.Affinity.NodeAffinity).NotTo(BeNil(), "pod %s should have node affinity", pod.Name)
+						Expect(pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution).NotTo(BeEmpty(),
+							"pod %s should have preferred node affinity", pod.Name)
+
+						// Check for control plane node affinity
+						hasControlPlaneAffinity := false
+						for _, term := range pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+							if term.Weight == int32(controlPlaneNodeSchedulingAffinityWeight) {
+								for _, req := range term.Preference.MatchExpressions {
+									if req.Key == controlPlaneLabelTolerationKey && req.Operator == corev1.NodeSelectorOpIn {
+										hasControlPlaneAffinity = true
+										break
+									}
+								}
+							}
+						}
+						Expect(hasControlPlaneAffinity).To(BeTrue(), "pod %s should have control plane node affinity", pod.Name)
+
+						// Check for pod affinity
+						Expect(pod.Spec.Affinity.PodAffinity).NotTo(BeNil(), "pod %s should have pod affinity", pod.Name)
+						Expect(pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution).NotTo(BeEmpty(),
+							"pod %s should have preferred pod affinity", pod.Name)
+
+						hasColocationAffinity := false
+						for _, term := range pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+							if term.Weight != 100 || term.PodAffinityTerm.LabelSelector == nil {
+								continue
+							}
+							for _, value := range term.PodAffinityTerm.LabelSelector.MatchLabels {
+								if value == testCtx.ControlPlaneNamespace {
+									hasColocationAffinity = true
+									break
+								}
+							}
+							if term.PodAffinityTerm.LabelSelector.MatchLabels[colocationLabelKey] == testCtx.ControlPlaneNamespace {
+								hasColocationAffinity = true
+								break
+							}
+						}
+						Expect(hasColocationAffinity).To(BeTrue(), "pod %s should have colocation pod affinity", pod.Name)
+					}
+				})
+			})
+		}
+	})
+}
+
+// WorkloadRegistryValidationTest registers tests for workload registry validation
+func WorkloadRegistryValidationTest(getTestCtx internal.TestContextGetter) {
+	Context("Workload registry validation", func() {
+		It("should not contain any unrecognized pods", func() {
+			testCtx := getTestCtx()
+			podList := &corev1.PodList{}
+			err := testCtx.MgmtClient.List(testCtx.Context, podList, &crclient.ListOptions{
+				Namespace: testCtx.ControlPlaneNamespace,
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to list pods in control plane namespace")
+			Expect(podList.Items).NotTo(BeEmpty(),
+				"expected pods in control plane namespace %s", testCtx.ControlPlaneNamespace)
+
+			workloadSelectors := make(map[string]labels.Selector)
+			for _, workload := range workloads {
+				selector := labels.SelectorFromSet(workload.PodSelector)
+				workloadSelectors[workload.Name] = selector
+			}
+
+			var podsNotBelongingToWorkloads []string
+			for _, pod := range podList.Items {
+				belongsToWorkload := false
+				for _, selector := range workloadSelectors {
+					if selector.Matches(labels.Set(pod.Labels)) {
+						belongsToWorkload = true
+						break
+					}
+				}
+
+				if !belongsToWorkload {
+					podsNotBelongingToWorkloads = append(podsNotBelongingToWorkloads,
+						fmt.Sprintf("pod %s/%s", pod.Namespace, pod.Name))
+				}
+			}
+
+			Expect(podsNotBelongingToWorkloads).To(BeEmpty(),
+				"The following pods do not belong to any predefined workload:\n%s",
+				strings.Join(podsNotBelongingToWorkloads, "\n"))
+		})
+	})
+}
+
+// SecurityContextUIDTest registers tests for security context UID validation
+func SecurityContextUIDTest(getTestCtx internal.TestContextGetter) {
+	Context("Security context UID", func() {
+		// EnsureSecurityContextUID
+		var expectedUID int64
+
+		BeforeEach(func() {
+			testCtx := getTestCtx()
+			testCtx.SkipIfNotPlatform(hyperv1.AzurePlatform)
+
+			// Get the control plane namespace to check for UID annotation
+			controlPlaneNamespace := &corev1.Namespace{}
+			err := testCtx.MgmtClient.Get(testCtx.Context, crclient.ObjectKey{Name: testCtx.ControlPlaneNamespace}, controlPlaneNamespace)
+			Expect(err).NotTo(HaveOccurred(), "failed to get namespace %s", testCtx.ControlPlaneNamespace)
+
+			uid, ok := controlPlaneNamespace.Annotations["hypershift.openshift.io/default-security-context-uid"]
+			if !ok {
+				Skip(fmt.Sprintf("namespace %s missing SCC UID annotation", controlPlaneNamespace.Name))
+			}
+
+			parsedUID, err := strconv.ParseInt(uid, 10, 64)
+			Expect(err).NotTo(HaveOccurred(), "couldn't parse SCC UID %s from namespace %s", uid, controlPlaneNamespace.Name)
+			expectedUID = parsedUID
+		})
+
+		// TODO: Fix these in their corresponding repositories
+		exemptions := []string{
+			// Storage workloads
+			"azure-disk-csi-driver-controller",
+			"azure-disk-csi-driver-operator",
+			"azure-file-csi-driver-controller",
+			"azure-file-csi-driver-operator",
+
+			// Network workloads
+			"network-node-identity",
+			"ovnkube-control-plane",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have expected RunAsUser UID for pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					// Skip if workload is in exemption list
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from security context UID check", workload.Name))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						runAsUser := func() *int64 {
+							if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsUser == nil {
+								return nil
+							}
+							return pod.Spec.SecurityContext.RunAsUser
+						}()
+
+						if runAsUser == nil {
+							Fail(fmt.Sprintf("pod %s/%s: RunAsUser is not set (expected UID %d)", pod.Namespace, pod.Name, expectedUID))
+						}
+
+						Expect(*runAsUser).To(Equal(expectedUID),
+							"pod %s/%s: RunAsUser %d does not match expected UID %d",
+							pod.Namespace, pod.Name, *runAsUser, expectedUID)
+					}
+				})
+			})
+		}
+	})
+}
+
+func NoCrashingPodsTest(getTestCtx internal.TestContextGetter) {
+	Context("No crashing pods", func() {
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should have no crashing pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					defaultCrashToleration := defaultCrashTolerationForCluster(hostedCluster)
+					var toleration int32
+
+					var k8sClient kubernetes.Interface
+					for _, pod := range pods {
+						toleration = crashTolerationForComponent(workload.Name, defaultCrashToleration)
+						for _, containerStatus := range pod.Status.ContainerStatuses {
+							if containerStatus.RestartCount <= toleration {
+								continue
+							}
+							if strings.HasPrefix(pod.Name, "kube-controller-manager-") {
+								if isCertificateTriggeredRestart(testCtx.Context, testCtx.MgmtClient, &pod) {
+									continue
+								}
+							}
+							if k8sClient == nil {
+								mgmtRestConfig, err := e2eutil.GetConfig()
+								Expect(err).NotTo(HaveOccurred(), "failed to get management REST config for log inspection")
+								k8sClient, err = kubernetes.NewForConfig(mgmtRestConfig)
+								Expect(err).NotTo(HaveOccurred(), "failed to create kubernetes clientset for log inspection")
+							}
+							if isLeaderElectionFailure(testCtx.Context, k8sClient, &pod, containerStatus.Name) {
+								continue
+							}
+							Expect(containerStatus.RestartCount).To(BeNumerically("<=", toleration),
+								"container %s in pod %s has too many restarts (%d > %d)",
+								containerStatus.Name, pod.Name, containerStatus.RestartCount, toleration)
+						}
+					}
+				})
+			})
+		}
+	})
+}
+
+// CustomLabelsTest registers per-workload tests for custom label propagation
+func CustomLabelsTest(getTestCtx internal.TestContextGetter) {
+	Context("Custom labels", Label("Informing"), func() {
+		BeforeEach(func() {
+			getTestCtx().SkipIfVersionBelow(e2eutil.Version419)
+		})
+
+		exemptions := []string{
+			"virt-launcher",
+			"vmi-console-debug",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should propagate custom labels to pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from custom labels check", workload.Name))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						Expect(pod.Labels).To(HaveKeyWithValue("hypershift-e2e-test-label", "test"),
+							"pod %s should have custom label hypershift-e2e-test-label=test", pod.Name)
+					}
+				})
+			})
+		}
+	})
+}
+
+// CustomTolerationsTest registers per-workload tests for custom toleration propagation
+func CustomTolerationsTest(getTestCtx internal.TestContextGetter) {
+	Context("Custom tolerations", Label("Informing"), func() {
+		BeforeEach(func() {
+			getTestCtx().SkipIfVersionBelow(e2eutil.Version419)
+		})
+
+		exemptions := []string{
+			"virt-launcher",
+			"vmi-console-debug",
+		}
+
+		for _, workload := range workloads {
+			Context(workload.Name, func() {
+				It("should propagate custom tolerations to pods", func() {
+					testCtx := getTestCtx()
+					hostedCluster, err := testCtx.GetHostedCluster()
+					Expect(err).NotTo(HaveOccurred())
+					if internal.ShouldSkipWorkloadForPlatform(workload, hostedCluster) {
+						Skip(fmt.Sprintf("workload %s is platform-specific and doesn't match cluster platform", workload.Name))
+					}
+					testCtx.SkipIfWorkloadUnsupportedForVersion(workload)
+					if slices.Contains(exemptions, workload.Name) {
+						Skip(fmt.Sprintf("workload %s is exempt from custom tolerations check", workload.Name))
+					}
+
+					pods := getWorkloadPods(testCtx, workload)
+					if len(pods) == 0 {
+						Skip(fmt.Sprintf("no pods found for workload %s", workload.Name))
+					}
+
+					for _, pod := range pods {
+						Expect(pod.Spec.Tolerations).To(ContainElement(corev1.Toleration{
+							Key:      "hypershift-e2e-test-toleration",
+							Operator: corev1.TolerationOpEqual,
+							Value:    "true",
+							Effect:   corev1.TaintEffectNoSchedule,
+						}), "pod %s should have custom toleration hypershift-e2e-test-toleration", pod.Name)
+					}
+				})
+			})
+		}
+	})
+}
+
+// RegisterControlPlaneWorkloadsTests registers all control plane workloads tests
+func DesiredStateHashAnnotationTest(getTestCtx internal.TestContextGetter) {
+	Context("Desired state hash annotation", func() {
+		for _, w := range workloads {
+			workload := w
+			Context(workload.Name, func() {
+				It("should carry desired-state-hash annotation if managed by control-plane-operator", func() {
+					tc := getTestCtx()
+
+					deploy := &appsv1.Deployment{}
+					err := tc.MgmtClient.Get(tc.Context, crclient.ObjectKey{Namespace: tc.ControlPlaneNamespace, Name: workload.Name}, deploy)
+					if apierrors.IsNotFound(err) {
+						Skip(fmt.Sprintf("Deployment %s not found in %s", workload.Name, tc.ControlPlaneNamespace))
+					}
+					Expect(err).NotTo(HaveOccurred(), "failed to get Deployment %s/%s", tc.ControlPlaneNamespace, workload.Name)
+
+					if deploy.Labels["hypershift.openshift.io/managed-by"] != "control-plane-operator" {
+						Skip(fmt.Sprintf("Deployment %s/%s is not managed by control-plane-operator", deploy.Namespace, deploy.Name))
+					}
+
+					hash, ok := deploy.Annotations[upsert.DesiredStateHashAnnotation]
+					Expect(ok).To(BeTrue(),
+						"Deployment %s/%s is missing the %s annotation",
+						deploy.Namespace, deploy.Name, upsert.DesiredStateHashAnnotation)
+					Expect(desiredStateHashHexRE.MatchString(hash)).To(BeTrue(),
+						"Deployment %s/%s has invalid desired-state-hash %q (expected 64 hex chars)",
+						deploy.Namespace, deploy.Name, hash)
+				})
+			})
+		}
+	})
+}
+
+func RegisterControlPlaneWorkloadsTests(getTestCtx internal.TestContextGetter) {
+	WorkloadRegistryValidationTest(getTestCtx)
+	DeploymentGenerationTest(getTestCtx)
+	NoCrashingPodsTest(getTestCtx)
+	SafeToEvictAnnotationsTest(getTestCtx)
+	ReadOnlyRootFilesystemTest(getTestCtx)
+	ReadOnlyRootFilesystemTmpDirMountTest(getTestCtx)
+	ContainerImagePullPolicyTest(getTestCtx)
+	ContainerTerminationMessagePolicyTest(getTestCtx)
+	ContainerResourceRequestsTest(getTestCtx)
+	PodPriorityTest(getTestCtx)
+	ServiceAccountTokenMountingTest(getTestCtx)
+	PodAffinitiesAndTolerationsTest(getTestCtx)
+	CustomLabelsTest(getTestCtx)
+	CustomTolerationsTest(getTestCtx)
+	SecurityContextUIDTest(getTestCtx)
+	DesiredStateHashAnnotationTest(getTestCtx)
+}
+
+var _ = Describe("[sig-hypershift][Jira:Hypershift][Feature:ControlPlaneWorkloads] Control Plane Workloads", Label("control-plane-workloads"), func() {
+	var (
+		testCtx *internal.TestContext
+	)
+
+	BeforeEach(func() {
+		testCtx = internal.GetTestContext()
+		Expect(testCtx).NotTo(BeNil(), "test context should be set up in BeforeSuite")
+	})
+
+	RegisterControlPlaneWorkloadsTests(func() *internal.TestContext { return testCtx })
+})

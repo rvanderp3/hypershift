@@ -80,6 +80,11 @@ type OAuthConfig struct {
 
 	// templates allow you to customize pages like the login page.
 	Templates *OAuthTemplates `json:"templates"`
+
+	// proxyTrustedCA is an optional path to a PEM-encoded CA bundle used to
+	// verify connections to an HTTPS proxy during outbound IdP requests.
+	// When omitted, proxy connections use the system trust roots only.
+	ProxyTrustedCA string `json:"proxyTrustedCA,omitempty"`
 }
 
 // OAuthTemplates allow for customization of pages like the login page
@@ -397,6 +402,9 @@ type OpenIDClaims struct {
 	// email is the list of claims whose values should be used as the email address. Optional.
 	// If unspecified, no email is set for the identity
 	Email []string `json:"email"`
+	// groups is the list of claims value of which should be used to synchronize groups
+	// from the OIDC provider to OpenShift for the user
+	Groups []string `json:"groups"`
 }
 
 // GrantConfig holds the necessary configuration options for grant handlers
@@ -470,7 +478,7 @@ type TokenConfig struct {
 type SessionSecrets struct {
 	metav1.TypeMeta `json:",inline"`
 
-	// Secrets is a list of secrets
+	// secrets is a list of secrets
 	// New sessions are signed and encrypted using the first secret.
 	// Existing sessions are decrypted/authenticated by each secret until one succeeds. This allows rotating secrets.
 	Secrets []SessionSecret `json:"secrets"`
@@ -478,8 +486,8 @@ type SessionSecrets struct {
 
 // SessionSecret is a secret used to authenticate/decrypt cookie-based sessions
 type SessionSecret struct {
-	// Authentication is used to authenticate sessions using HMAC. Recommended to use a secret with 32 or 64 bytes.
+	// authentication is used to authenticate sessions using HMAC. Recommended to use a secret with 32 or 64 bytes.
 	Authentication string `json:"authentication"`
-	// Encryption is used to encrypt sessions. Must be 16, 24, or 32 characters long, to select AES-128, AES-
+	// encryption is used to encrypt sessions. Must be 16, 24, or 32 characters long, to select AES-128, AES-
 	Encryption string `json:"encryption"`
 }

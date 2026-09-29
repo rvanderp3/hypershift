@@ -1,9 +1,11 @@
 package infra
 
 import (
-	"github.com/spf13/cobra"
-
 	"github.com/openshift/hypershift/cmd/infra/aws"
+	"github.com/openshift/hypershift/cmd/infra/azure"
+	"github.com/openshift/hypershift/cmd/infra/gcp"
+
+	"github.com/spf13/cobra"
 )
 
 func NewDestroyIAMCommand() *cobra.Command {
@@ -14,6 +16,8 @@ func NewDestroyIAMCommand() *cobra.Command {
 	}
 
 	cmd.AddCommand(aws.NewDestroyIAMCommand())
+	cmd.AddCommand(azure.NewDestroyIAMCommand())
+	cmd.AddCommand(gcp.NewDestroyIAMCommand())
 
 	return cmd
 }

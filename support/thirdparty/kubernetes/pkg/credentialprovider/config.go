@@ -20,17 +20,9 @@ package credentialprovider
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
-)
-
-const (
-	maxReadLength = 10 * 1 << 20 // 10MB
 )
 
 // DockerConfigJSON represents ~/.docker/config.json file info
@@ -53,24 +45,11 @@ type DockerConfigEntry struct {
 	Email    string
 }
 
-var (
-	preferredPathLock sync.Mutex
-	preferredPath     = ""
-	workingDirPath    = ""
-	homeDirPath, _    = os.UserHomeDir()
-	rootDirPath       = "/"
-	homeJSONDirPath   = filepath.Join(homeDirPath, ".docker")
-	rootJSONDirPath   = filepath.Join(rootDirPath, ".docker")
-
-	configFileName     = ".dockercfg"
-	configJSONFileName = "config.json"
-)
-
-//ReadSpecificDockerConfigJSONFile attempts to read docker configJSON from a given file path.
+// ReadSpecificDockerConfigJSONFile attempts to read docker configJSON from a given file path.
 func ReadSpecificDockerConfigJSONFile(filePath string) (cfg DockerConfig, err error) {
 	var contents []byte
 
-	if contents, err = ioutil.ReadFile(filePath); err != nil {
+	if contents, err = os.ReadFile(filePath); err != nil {
 		return nil, err
 	}
 
@@ -84,7 +63,7 @@ func ReadSpecificDockerConfigJSONFile(filePath string) (cfg DockerConfig, err er
 func ReadDockerConfigJSONFileFromBytes(contents []byte) (cfg DockerConfig, err error) {
 	var cfgJSON DockerConfigJSON
 	if err = json.Unmarshal(contents, &cfgJSON); err != nil {
-		return nil, errors.New("error occurred while trying to unmarshal json")
+		return nil, fmt.Errorf("error occurred while trying to unmarshal json: %w", err)
 	}
 	cfg = cfgJSON.Auths
 	return

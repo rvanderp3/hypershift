@@ -4,21 +4,27 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/bombsimon/logrusr"
-	"github.com/go-logr/logr"
-	"github.com/google/go-cmp/cmp"
-	"github.com/sirupsen/logrus"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
+	"go.uber.org/zap/zapcore"
 )
 
 func newUpdateLoopDetector() *updateLoopDetector {
 	return &updateLoopDetector{
-		hasNoOpUpdate:    sets.String{},
+		hasNoOpUpdate:    sets.New[string](),
 		updateEventCount: map[string]int{},
-		log:              logrusr.NewLogger(func() logrus.FieldLogger { l := logrus.New(); l.SetFormatter(&logrus.JSONFormatter{}); return l }()),
+		log: zap.New(zap.JSONEncoder(func(o *zapcore.EncoderConfig) {
+			o.EncodeTime = zapcore.RFC3339TimeEncoder
+		})),
 	}
 }
 
@@ -31,10 +37,13 @@ const LoopDetectorWarningMessage = "WARNING: Object got updated more than one ti
 // in the future.
 // Once we did a no-op update, we will ignore the object because we assume that if we have
 // a bug in the defaulting, we will end up always updating.
-const updateLoopThreshold = 2
+func updateLoopThreshold(o runtime.Object) int {
+	// Give some leeway, if we actually revert defaults we will do a lot more than this
+	return 10
+}
 
 type updateLoopDetector struct {
-	hasNoOpUpdate    sets.String
+	hasNoOpUpdate    sets.Set[string]
 	lock             sync.RWMutex
 	updateEventCount map[string]int
 	log              logr.Logger
@@ -51,6 +60,11 @@ func (uld *updateLoopDetector) recordNoOpUpdate(obj crclient.Object, key crclien
 }
 
 func (uld *updateLoopDetector) recordActualUpdate(original, modified runtime.Object, key crclient.ObjectKey) {
+	// We have multiple controllers acting on these and they have no defaulting, which incorrectly triggers the
+	// detector. Just skip them.
+	if _, isAWSEndpointService := original.(*hyperv1.AWSEndpointService); isAWSEndpointService {
+		return
+	}
 	cacheKey := uld.keyFor(original, key)
 	uld.lock.RLock()
 	hasNoOpUpdate := uld.hasNoOpUpdate.Has(cacheKey)
@@ -65,7 +79,7 @@ func (uld *updateLoopDetector) recordActualUpdate(original, modified runtime.Obj
 	updateEventCount := uld.updateEventCount[cacheKey]
 	uld.lock.Unlock()
 
-	if updateEventCount < updateLoopThreshold {
+	if updateEventCount < updateLoopThreshold(original) {
 		return
 	}
 
